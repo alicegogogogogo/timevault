@@ -668,6 +668,414 @@ class TimeVaultTests(unittest.TestCase):
             )
 
 
+class BatchTests(unittest.TestCase):
+    """Atomic batch import: POST /batch semantics at the service layer."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.clock = Clock()
+        self.vault = TimeVault(str(Path(self.directory.name) / "vault.db"), self.clock)
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def run_batch(self, operations, key: str = "batch-1"):
+        return self.vault.run_batch({"operations": operations}, key)
+
+    def create_op(self, entity_id="acct-1", entity_type="account", **fields):
+        op = {"operation": "create", "type": entity_type, "id": entity_id}
+        op.update(fields)
+        if "attributes" not in op:
+            op["attributes"] = {"status": "active", "tier": "gold"}
+        return op
+
+    def correct_op(self, facts, entity_id="acct-1", entity_type="account", **fields):
+        op = {"operation": "correct", "type": entity_type, "id": entity_id, "facts": facts}
+        op.update(fields)
+        return op
+
+    # -- happy path ---------------------------------------------------------
+
+    def test_batch_create_then_correct_shares_one_recorded_at(self):
+        self.clock.advance(days=3)
+        result = self.run_batch(
+            [
+                self.create_op(valid_from="2024-01-01T00:00:00Z"),
+                self.correct_op(
+                    [{"attribute": "tier", "value": "platinum"}],
+                    as_of="2024-03-01T00:00:00Z",
+                ),
+            ]
+        )
+        self.assertEqual("2024-05-04T00:00:00.000Z", result["recorded_at"])
+        self.assertEqual(2, len(result["results"]))
+
+        created, corrected = result["results"]
+        self.assertEqual("create", created["operation"])
+        self.assertEqual("2024-05-04T00:00:00.000Z", created["created_at"])
+        self.assertEqual("gold", created["attributes"]["tier"]["value"])
+        self.assertEqual(1, created["attributes"]["tier"]["version"])
+
+        self.assertEqual("correct", corrected["operation"])
+        self.assertNotIn("created_at", corrected)
+        self.assertEqual("platinum", corrected["attributes"]["tier"]["value"])
+        # The correction appended a version, and both rows carry the batch's
+        # single transaction instant.
+        self.assertEqual(2, corrected["attributes"]["tier"]["version"])
+        for document in result["results"]:
+            self.assertEqual(result["recorded_at"], document["known_at"])
+            self.assertEqual(
+                result["recorded_at"],
+                document["attributes"]["tier"]["recorded_at"],
+            )
+
+    def test_later_operation_sees_the_earlier_operation(self):
+        """A correction in the same batch lands on the entity just created."""
+        result = self.run_batch(
+            [
+                self.create_op(valid_from="2024-01-01T00:00:00Z"),
+                self.correct_op(
+                    [{"attribute": "region", "value": "emea"}],
+                    as_of="2024-02-01T00:00:00Z",
+                ),
+            ]
+        )
+        self.assertEqual(
+            {"region": "emea", "status": "active", "tier": "gold"},
+            {
+                name: entry["value"]
+                for name, entry in result["results"][1]["attributes"].items()
+            },
+        )
+        # The finished entity reads through the ordinary entry point.
+        document = self.vault.entity_as_of("account", "acct-1", "2024-04-01T00:00:00Z")
+        self.assertEqual("emea", document["attributes"]["region"]["value"])
+        self.assertEqual("gold", document["attributes"]["tier"]["value"])
+
+    def test_consecutive_corrections_append_continuous_non_overlapping_history(self):
+        result = self.run_batch(
+            [
+                self.create_op(valid_from="2024-01-01T00:00:00Z"),
+                self.correct_op(
+                    [{"attribute": "tier", "value": "platinum"}],
+                    as_of="2024-03-01T00:00:00Z",
+                ),
+                self.correct_op(
+                    [{"attribute": "tier", "value": "silver"}],
+                    as_of="2024-04-01T00:00:00Z",
+                ),
+            ]
+        )
+        self.assertEqual([1, 2, 3], [r["attributes"]["tier"]["version"] for r in result["results"]])
+        versions = [
+            item
+            for item in self.vault.history("account", "acct-1")["attributes"]
+            if item["attribute"] == "tier"
+        ][0]["versions"]
+        self.assertEqual(["gold", "platinum", "silver"], [v["value"] for v in versions])
+        windows = sorted((v["valid_from_ms"], v["valid_end_ms"]) for v in versions)
+        for (_, earlier_end), (later_start, _) in zip(windows, windows[1:]):
+            self.assertEqual(earlier_end, later_start)
+        # All rows share the batch transaction instant on the transaction axis.
+        for version in versions:
+            self.assertEqual(result["recorded_at"], version["recorded_at"])
+
+    def test_batch_matches_the_same_writes_done_one_request_at_a_time(self):
+        """A batch is bitemporally identical to the individual writes at one instant."""
+        operations = [
+            self.create_op(valid_from="2024-01-01T00:00:00Z"),
+            self.correct_op(
+                [{"attribute": "tier", "value": "platinum"}],
+                as_of="2024-03-01T00:00:00Z",
+            ),
+            self.correct_op(
+                [{"attribute": "tier", "value": "silver", "valid_from": "2024-02-01T00:00:00Z"}]
+            ),
+        ]
+        self.run_batch(operations)
+
+        other_directory = tempfile.TemporaryDirectory()
+        try:
+            other = TimeVault(str(Path(other_directory.name) / "v.db"), self.clock)
+            other.create_entity(
+                "account",
+                {"id": "acct-1", "attributes": {"status": "active", "tier": "gold"},
+                 "valid_from": "2024-01-01T00:00:00Z"},
+                "c1",
+            )
+            other.apply_correction(
+                "account",
+                "acct-1",
+                {"as_of": "2024-03-01T00:00:00Z", "facts": [{"attribute": "tier", "value": "platinum"}]},
+                "c2",
+            )
+            other.apply_correction(
+                "account",
+                "acct-1",
+                {"facts": [{"attribute": "tier", "value": "silver", "valid_from": "2024-02-01T00:00:00Z"}]},
+                "c3",
+            )
+            self.assertEqual(
+                self.vault.history("account", "acct-1"),
+                other.history("account", "acct-1"),
+            )
+            for as_of in ("2024-01-15T00:00:00Z", "2024-02-15T00:00:00Z", "2024-05-15T00:00:00Z"):
+                self.assertEqual(
+                    self.vault.entity_as_of("account", "acct-1", as_of),
+                    other.entity_as_of("account", "acct-1", as_of),
+                )
+        finally:
+            other_directory.cleanup()
+
+    def test_batch_can_correct_a_pre_existing_entity(self):
+        self.vault.create_entity(
+            "account",
+            {"id": "old", "attributes": {"tier": "gold"}, "valid_from": "2024-01-01T00:00:00Z"},
+            "earlier",
+        )
+        self.clock.advance(days=10)
+        result = self.run_batch(
+            [self.correct_op([{"attribute": "tier", "value": "silver"}], entity_id="old")],
+            key="batch-old",
+        )
+        self.assertEqual("silver", result["results"][0]["attributes"]["tier"]["value"])
+        self.assertEqual(2, result["results"][0]["attributes"]["tier"]["version"])
+
+    def test_as_of_defaults_to_recorded_at(self):
+        result = self.run_batch(
+            [
+                self.create_op(valid_from="2024-01-01T00:00:00Z"),
+                self.correct_op([{"attribute": "tier", "value": "platinum"}]),
+            ]
+        )
+        # With no as_of the fact starts at the batch instant, so the old value
+        # still supplies earlier business time and platinum supplies now.
+        self.assertEqual(
+            "gold",
+            self.vault.entity_as_of("account", "acct-1", "2024-04-01T00:00:00Z")["attributes"]["tier"]["value"],
+        )
+        self.assertEqual("platinum", result["results"][1]["attributes"]["tier"]["value"])
+
+    # -- idempotency --------------------------------------------------------
+
+    def test_batch_replay_returns_the_first_response_and_adds_no_versions(self):
+        operations = [
+            self.create_op(valid_from="2024-01-01T00:00:00Z"),
+            self.correct_op([{"attribute": "tier", "value": "platinum"}], as_of="2024-03-01T00:00:00Z"),
+        ]
+        first = self.run_batch(operations, key="same")
+        self.clock.advance(days=99)
+        replayed = self.run_batch(operations, key="same")
+        self.assertEqual(first, replayed)
+        versions = [
+            item for item in self.vault.history("account", "acct-1")["attributes"]
+            if item["attribute"] == "tier"
+        ][0]["versions"]
+        self.assertEqual(2, len(versions))
+
+    def test_same_key_for_a_different_batch_is_conflict(self):
+        self.run_batch([self.create_op(entity_id="a")], key="shared")
+        with self.assertRaisesRegex(ConflictError, "another operation"):
+            self.run_batch([self.create_op(entity_id="b")], key="shared")
+
+    def test_batch_requires_an_idempotency_key(self):
+        with self.assertRaisesRegex(ValidationError, "Idempotency-Key"):
+            self.vault.run_batch({"operations": [self.create_op()]}, None)
+
+    # -- errors -------------------------------------------------------------
+
+    def test_request_shape_validation(self):
+        cases = [
+            ([], "request body must be a JSON object"),
+            ({}, "operations must be an array"),
+            ({"operations": {}}, "operations must be an array"),
+            ({"operations": []}, "at least one item"),
+            ({"operations": [self.create_op()], "extra": 1}, "unknown field"),
+        ]
+        for body, message in cases:
+            with self.subTest(body=body):
+                with self.assertRaisesRegex(ValidationError, message):
+                    self.vault.run_batch(body, "k")
+
+    def test_more_than_1000_operations_is_rejected(self):
+        too_many = [self.create_op(entity_id=f"e{i}") for i in range(1001)]
+        with self.assertRaisesRegex(ValidationError, "at most 1000"):
+            self.vault.run_batch({"operations": too_many}, "k")
+
+    def test_exactly_1000_operations_commit(self):
+        operations = [self.create_op(entity_id=f"e{i:04d}") for i in range(1000)]
+        result = self.vault.run_batch({"operations": operations}, "k")
+        self.assertEqual(1000, len(result["results"]))
+        self.assertTrue(all(r["operation"] == "create" for r in result["results"]))
+
+    def test_operation_errors_carry_the_one_based_index(self):
+        cases = [
+            ([{"operation": "delete", "type": "account", "id": "a"}], 1, 'operation must be "create" or "correct"'),
+            ([self.create_op(), {"operation": "create", "type": "account", "id": "c"}], 2, "attributes is required"),
+            ([self.create_op(), self.correct_op([{"attribute": "tier", "value": 1}], bogus=2)], 2, "unknown field"),
+        ]
+        for operations, index, message in cases:
+            with self.subTest(operations=operations):
+                with self.assertRaisesRegex(ValidationError, rf"operation {index}: {message}"):
+                    self.vault.run_batch({"operations": operations}, "k")
+
+    def test_missing_type_id_and_facts_are_validation_errors_with_index(self):
+        for bad in (
+            {"operation": "create", "id": "a", "attributes": {"x": 1}},
+            {"operation": "create", "type": "account", "attributes": {"x": 1}},
+            {"operation": "correct", "type": "account", "id": "a"},
+            "not-an-object",
+        ):
+            with self.subTest(bad=bad):
+                with self.assertRaisesRegex(ValidationError, r"operation 1:"):
+                    self.vault.run_batch({"operations": [bad]}, "k")
+
+    def test_correct_on_a_never_existing_entity_is_not_found(self):
+        with self.assertRaisesRegex(NotFoundError, r"operation 1: .* does not exist"):
+            self.run_batch(
+                [self.correct_op([{"attribute": "tier", "value": "x"}], entity_id="ghost")],
+                key="k",
+            )
+
+    def test_correcting_before_the_in_batch_create_is_conflict(self):
+        with self.assertRaisesRegex(ConflictError, r"operation 1: .* before it is created"):
+            self.run_batch(
+                [
+                    self.correct_op([{"attribute": "tier", "value": "x"}], entity_id="later"),
+                    self.create_op(entity_id="later"),
+                ],
+                key="k",
+            )
+
+    def test_duplicate_create_against_existing_entity_is_conflict(self):
+        self.vault.create_entity(
+            "account",
+            {"id": "dup", "attributes": {"tier": "gold"}},
+            "earlier",
+        )
+        with self.assertRaisesRegex(ConflictError, r"operation 1: .* already exists"):
+            self.run_batch([self.create_op(entity_id="dup")], key="k")
+
+    def test_duplicate_create_inside_one_batch_is_conflict(self):
+        with self.assertRaisesRegex(ConflictError, r"operation 2: .* already exists"):
+            self.run_batch([self.create_op(entity_id="d"), self.create_op(entity_id="d")], key="k")
+
+    def test_explicit_as_of_after_recorded_at_is_validation_error(self):
+        self.clock.advance(days=3)
+        with self.assertRaisesRegex(ValidationError, r"operation 2: as_of must not be in the future"):
+            self.run_batch(
+                [
+                    self.create_op(),
+                    self.correct_op(
+                        [{"attribute": "tier", "value": "x"}],
+                        as_of="2024-12-31T00:00:00Z",
+                    ),
+                ]
+            )
+
+    def test_valid_end_before_valid_from_is_validation_error(self):
+        with self.assertRaisesRegex(ValidationError, r"operation 2: .*valid_end must be later"):
+            self.run_batch(
+                [
+                    self.create_op(valid_from="2024-01-01T00:00:00Z"),
+                    self.correct_op(
+                        [{
+                            "attribute": "tier", "value": "x",
+                            "valid_from": "2024-03-01T00:00:00Z",
+                            "valid_end": "2024-02-01T00:00:00Z",
+                        }]
+                    ),
+                ]
+            )
+
+    def test_create_valid_from_in_the_future_is_validation_error(self):
+        self.clock.advance(days=3)
+        with self.assertRaisesRegex(ValidationError, r"operation 1: valid_from must not be in the future"):
+            self.run_batch([self.create_op(valid_from="2030-01-01T00:00:00Z")])
+
+    def test_a_failed_batch_writes_nothing(self):
+        from timevault.errors import NotFoundError as _NF
+
+        with self.assertRaises(ConflictError):
+            self.run_batch(
+                [
+                    self.create_op(entity_id="ok"),
+                    self.create_op(entity_id="ok"),
+                    self.create_op(entity_id="never"),
+                ]
+            )
+        # Neither the entity created earlier in the batch nor anything after the
+        # failure is visible: the whole request rolled back.
+        for entity_id in ("ok", "never"):
+            with self.assertRaises(_NF):
+                self.vault.entity_as_of("account", entity_id)
+
+    def test_a_failed_batch_does_not_consume_its_key(self):
+        """A request that never committed can be retried under the same key."""
+        good = [self.create_op(entity_id="ok")]
+        with self.assertRaises(NotFoundError):
+            self.run_batch(
+                [self.create_op(entity_id="ok"),
+                 self.correct_op([{"attribute": "tier", "value": "x"}], entity_id="ghost")],
+                key="retry",
+            )
+        result = self.run_batch(good, key="retry")
+        self.assertEqual(1, len(result["results"]))
+
+    # -- concurrency --------------------------------------------------------
+
+    def test_concurrent_batches_serialize_into_one_consistent_ledger(self):
+        self.vault.create_entity(
+            "account",
+            {"id": "shared", "attributes": {"tier": "gold"},
+             "valid_from": "2024-01-01T00:00:00Z"},
+            "seed",
+        )
+
+        errors: list[BaseException] = []
+
+        def worker(number: int) -> None:
+            try:
+                self.run_batch(
+                    [
+                        self.correct_op(
+                            [{"attribute": "tier", "value": f"v{number}",
+                              "valid_from": f"2024-03-{number + 1:02d}T00:00:00Z"}],
+                            entity_id="shared",
+                        )
+                    ],
+                    key=f"concurrent-{number}",
+                )
+            except BaseException as error:  # pragma: no cover - surfaced below
+                errors.append(error)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+
+        self.assertEqual([], errors)
+        versions = [
+            item for item in self.vault.history("account", "shared")["attributes"]
+            if item["attribute"] == "tier"
+        ][0]["versions"]
+        # One seed version plus one per committed batch.  Version numbers are a
+        # continuous set with no gaps even though commit order (and so the
+        # number each thread drew) is non-deterministic.
+        self.assertEqual(list(range(1, 10)), sorted(v["version"] for v in versions))
+        # Walking business time forward the valid windows never overlap,
+        # whatever order the batches committed in.
+        windows = sorted(
+            (v["valid_from_ms"], v["valid_end_ms"])
+            for v in versions
+            if v["operation"] == "assert"
+        )
+        for (_, earlier_end), (later_start, _) in zip(windows, windows[1:]):
+            if earlier_end is not None:
+                self.assertLessEqual(earlier_end, later_start)
+
+
 class HttpTests(unittest.TestCase):
     """Exercise the real socket server: routing, verbs, status codes."""
 
@@ -755,6 +1163,77 @@ class HttpTests(unittest.TestCase):
         status, body = self.call("GET", "/entities/account/acct-1?nope=1")
         self.assertEqual(400, status)
         self.assertRegex(body["error"]["message"], "unknown query parameter")
+
+    def test_batch_over_http_commits_and_replays(self):
+        body = {
+            "operations": [
+                {
+                    "operation": "create",
+                    "type": "account",
+                    "id": "acct-1",
+                    "attributes": {"tier": "gold"},
+                    "valid_from": "2024-01-01T00:00:00Z",
+                },
+                {
+                    "operation": "correct",
+                    "type": "account",
+                    "id": "acct-1",
+                    "as_of": "2024-03-01T00:00:00Z",
+                    "facts": [{"attribute": "tier", "value": "platinum"}],
+                },
+            ]
+        }
+        status, document = self.call("POST", "/batch", body, "batch-1")
+        self.assertEqual(200, status)
+        self.assertIn("recorded_at", document)
+        self.assertEqual(2, len(document["results"]))
+        self.assertEqual("create", document["results"][0]["operation"])
+        self.assertEqual("correct", document["results"][1]["operation"])
+        self.assertEqual("platinum", document["results"][1]["attributes"]["tier"]["value"])
+        self.assertEqual(2, document["results"][1]["attributes"]["tier"]["version"])
+
+        # The finished entity is visible through the ordinary read entry.
+        status, read = self.call("GET", "/entities/account/acct-1")
+        self.assertEqual(200, status)
+        self.assertEqual("platinum", read["attributes"]["tier"]["value"])
+
+        # Replaying the same key returns the original response and writes again
+        # nothing: the tier still has exactly two versions.
+        self.clock.advance(days=40)
+        status, replay = self.call("POST", "/batch", body, "batch-1")
+        self.assertEqual(200, status)
+        self.assertEqual(document, replay)
+        status, history = self.call("GET", "/entities/account/acct-1/history")
+        self.assertEqual(2, len(history["attributes"][0]["versions"]))
+
+    def test_batch_over_http_requires_idempotency_key(self):
+        status, body = self.call(
+            "POST",
+            "/batch",
+            {"operations": [
+                {"operation": "create", "type": "account", "id": "a", "attributes": {"x": 1}}
+            ]},
+            None,
+        )
+        self.assertEqual(400, status)
+        self.assertEqual("validation_error", body["error"]["code"])
+
+    def test_batch_over_http_reports_indexed_conflict_and_rolls_back(self):
+        status, body = self.call(
+            "POST",
+            "/batch",
+            {"operations": [
+                {"operation": "correct", "type": "account", "id": "a",
+                 "facts": [{"attribute": "x", "value": 1}]},
+                {"operation": "create", "type": "account", "id": "a", "attributes": {"x": 1}},
+            ]},
+            "batch-bad",
+        )
+        self.assertEqual(409, status)
+        self.assertEqual("conflict", body["error"]["code"])
+        self.assertRegex(body["error"]["message"], r"operation 1:")
+        status, _ = self.call("GET", "/entities/account/a")
+        self.assertEqual(404, status)
 
     def test_diff_over_http(self):
         self.call(

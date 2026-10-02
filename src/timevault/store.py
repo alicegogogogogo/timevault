@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,6 +28,13 @@ class Store:
         if path != ":memory:":
             Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.clock = clock or (lambda: datetime.now(timezone.utc))
+        # One connection is shared across request threads, so every use of it is
+        # serialised by this lock.  A write holds it across its whole
+        # transaction, which is what commits different batches one after another
+        # (continuous versions, non-overlapping windows) and stops any reader on
+        # another thread observing a half-applied batch.  It is reentrant so the
+        # read helpers a write calls while holding the lock can take it again.
+        self.lock = threading.RLock()
         self.connection = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA journal_mode = WAL")
@@ -73,14 +81,18 @@ class Store:
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
-        self.connection.execute("BEGIN IMMEDIATE")
-        try:
-            yield self.connection
-        except Exception:
-            self.connection.execute("ROLLBACK")
-            raise
-        else:
-            self.connection.execute("COMMIT")
+        # Serialise whole transactions: BEGIN IMMEDIATE takes the write lock at
+        # once, and the RLock keeps every other thread (readers included) off the
+        # shared connection until COMMIT, so a batch is atomic to the outside.
+        with self.lock:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                yield self.connection
+            except Exception:
+                self.connection.execute("ROLLBACK")
+                raise
+            else:
+                self.connection.execute("COMMIT")
 
     def now(self) -> int:
         """Current instant as integer milliseconds since the Unix epoch."""
@@ -97,10 +109,11 @@ class Store:
     # -- entity bookkeeping -------------------------------------------------
 
     def entity_row(self, entity_type: str, entity_id: str) -> sqlite3.Row | None:
-        return self.connection.execute(
-            "SELECT created_at FROM entities WHERE type = ? AND id = ?",
-            (entity_type, entity_id),
-        ).fetchone()
+        with self.lock:
+            return self.connection.execute(
+                "SELECT created_at FROM entities WHERE type = ? AND id = ?",
+                (entity_type, entity_id),
+            ).fetchone()
 
     def insert_entity(self, entity_type: str, entity_id: str, created_at: int) -> None:
         self.connection.execute(
@@ -111,60 +124,64 @@ class Store:
     # -- versions -----------------------------------------------------------
 
     def versions_for_entity(self, entity_type: str, entity_id: str) -> list[sqlite3.Row]:
-        return list(
-            self.connection.execute(
-                """
-                SELECT attribute, version, operation, value, valid_from, valid_end,
-                       declared_end, recorded_at
-                  FROM versions
-                 WHERE type = ? AND id = ?
-                 ORDER BY attribute, valid_from, version
-                """,
-                (entity_type, entity_id),
-            ).fetchall()
-        )
+        with self.lock:
+            return list(
+                self.connection.execute(
+                    """
+                    SELECT attribute, version, operation, value, valid_from, valid_end,
+                           declared_end, recorded_at
+                      FROM versions
+                     WHERE type = ? AND id = ?
+                     ORDER BY attribute, valid_from, version
+                    """,
+                    (entity_type, entity_id),
+                ).fetchall()
+            )
 
     def versions_for_attribute(
         self, entity_type: str, entity_id: str, attribute: str
     ) -> list[sqlite3.Row]:
-        return list(
-            self.connection.execute(
-                """
-                SELECT attribute, version, operation, value, valid_from, valid_end,
-                       declared_end, recorded_at
-                  FROM versions
-                 WHERE type = ? AND id = ? AND attribute = ?
-                 ORDER BY valid_from, version
-                """,
-                (entity_type, entity_id, attribute),
-            ).fetchall()
-        )
+        with self.lock:
+            return list(
+                self.connection.execute(
+                    """
+                    SELECT attribute, version, operation, value, valid_from, valid_end,
+                           declared_end, recorded_at
+                      FROM versions
+                     WHERE type = ? AND id = ? AND attribute = ?
+                     ORDER BY valid_from, version
+                    """,
+                    (entity_type, entity_id, attribute),
+                ).fetchall()
+            )
 
     def next_version(self, entity_type: str, entity_id: str, attribute: str) -> int:
-        row = self.connection.execute(
-            """
-            SELECT COALESCE(MAX(version), 0) + 1 AS next
-              FROM versions
-             WHERE type = ? AND id = ? AND attribute = ?
-            """,
-            (entity_type, entity_id, attribute),
-        ).fetchone()
+        with self.lock:
+            row = self.connection.execute(
+                """
+                SELECT COALESCE(MAX(version), 0) + 1 AS next
+                  FROM versions
+                 WHERE type = ? AND id = ? AND attribute = ?
+                """,
+                (entity_type, entity_id, attribute),
+            ).fetchone()
         return int(row["next"])
 
     # -- truncations --------------------------------------------------------
 
     def truncations_for_entity(self, entity_type: str, entity_id: str) -> list[sqlite3.Row]:
-        return list(
-            self.connection.execute(
-                """
-                SELECT attribute, version, valid_end, recorded_at
-                  FROM truncations
-                 WHERE type = ? AND id = ?
-                 ORDER BY recorded_at, attribute, version
-                """,
-                (entity_type, entity_id),
-            ).fetchall()
-        )
+        with self.lock:
+            return list(
+                self.connection.execute(
+                    """
+                    SELECT attribute, version, valid_end, recorded_at
+                      FROM truncations
+                     WHERE type = ? AND id = ?
+                     ORDER BY recorded_at, attribute, version
+                    """,
+                    (entity_type, entity_id),
+                ).fetchall()
+            )
 
     def truncate_attribute(
         self,

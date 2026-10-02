@@ -294,6 +294,115 @@ class Correction:
         return cls(default_from, now, facts)
 
 
+@dataclass(frozen=True)
+class BatchCreate:
+    """One ``create`` item of a batch, parsed and ready to commit.
+
+    ``valid_from`` is ``None`` when the item declared none, in which case the
+    batch's transaction instant is the start of every initial window.
+    """
+
+    entity_type: str
+    entity_id: str
+    attributes: tuple[Attribute, ...]
+    valid_from: int | None
+
+
+@dataclass(frozen=True)
+class BatchCorrect:
+    """One ``correct`` item of a batch, parsed against the batch's clock.
+
+    The carried :class:`Correction` has every fact defaulted to the item's
+    ``as_of`` (or the request instant) and all bounds already validated.
+    """
+
+    entity_type: str
+    entity_id: str
+    correction: "Correction"
+
+
+_BATCH_OPERATION_FIELDS = {
+    "create": {"operation", "type", "id", "attributes", "valid_from"},
+    "correct": {"operation", "type", "id", "as_of", "facts"},
+}
+
+
+def _batch_op_kind(raw: dict[str, Any], index: int) -> str:
+    """Identify a batch item by its ``operation`` discriminator."""
+    label = f"operation {index}"
+    kind = raw.get("operation")
+    if not isinstance(kind, str) or kind not in ("create", "correct"):
+        raise ValidationError(
+            f'{label}: operation must be "create" or "correct"'
+        )
+    return kind
+
+
+def _parse_batch_operation(raw: Any, index: int, now: int) -> BatchCreate | BatchCorrect:
+    """Parse and validate one batch item, prefixing every error with its index.
+
+    Indices are one-based, because that is the position the request lists the
+    operation at.  Semantic checks that need the committed ledger (duplicate
+    create, correcting before creation) happen later, inside the transaction.
+    """
+    label = f"operation {index}"
+    try:
+        if not isinstance(raw, dict):
+            raise ValidationError("each operation must be a JSON object")
+        kind = _batch_op_kind(raw, index)
+        unknown = sorted(set(raw) - _BATCH_OPERATION_FIELDS[kind])
+        if unknown:
+            raise ValidationError(f"unknown field(s): {', '.join(unknown)}")
+        entity_type = identifier(raw.get("type"), "type")
+        entity_id = identifier(raw.get("id"), "id")
+
+        if kind == "create":
+            if "attributes" not in raw:
+                raise ValidationError("attributes is required")
+            body: dict[str, Any] = {"id": entity_id, "attributes": raw["attributes"]}
+            valid_from = None
+            if "valid_from" in raw:
+                body["valid_from"] = raw["valid_from"]
+                valid_from = instant(raw["valid_from"], "valid_from")
+                if valid_from > now:
+                    raise ValidationError("valid_from must not be in the future")
+            entity = Entity.parse(entity_type, body)
+            return BatchCreate(entity_type, entity_id, entity.attributes, valid_from)
+
+        if "facts" not in raw:
+            raise ValidationError("facts is required")
+        correction_body: dict[str, Any] = {"facts": raw["facts"]}
+        if "as_of" in raw:
+            correction_body["as_of"] = raw["as_of"]
+        correction = Correction.parse(correction_body, now)
+        return BatchCorrect(entity_type, entity_id, correction)
+    except ValidationError as error:
+        message = str(error)
+        if message.startswith(f"{label}:"):
+            raise
+        raise ValidationError(f"{label}: {message}") from error
+
+
+def parse_batch(raw: Any, now: int) -> tuple[BatchCreate | BatchCorrect, ...]:
+    """Validate a ``POST /batch`` request body into an ordered list of items."""
+    if not isinstance(raw, dict):
+        raise ValidationError("request body must be a JSON object")
+    unknown = sorted(set(raw) - {"operations"})
+    if unknown:
+        raise ValidationError(f"unknown field(s): {', '.join(unknown)}")
+    operations = raw.get("operations")
+    if not isinstance(operations, list):
+        raise ValidationError("operations must be an array")
+    if not operations:
+        raise ValidationError("operations must contain at least one item")
+    if len(operations) > 1000:
+        raise ValidationError("operations may contain at most 1000 items")
+    return tuple(
+        _parse_batch_operation(item, index, now)
+        for index, item in enumerate(operations, start=1)
+    )
+
+
 def epoch_millis(moment: datetime) -> int:
     """Convert an aware datetime to integer epoch milliseconds."""
     return _from_datetime(moment, "clock")

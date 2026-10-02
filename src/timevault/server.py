@@ -75,6 +75,11 @@ def make_handler(service: TimeVault) -> type[BaseHTTPRequestHandler]:
             if parts == ["health"] and self.command == "GET":
                 only(query, set())
                 return 200, {"status": "ok"}
+            if parts == ["batch"]:
+                if self.command != "POST":
+                    raise NotFoundError("route was not found")
+                only(query, set())
+                return 200, service.run_batch(self._body(), key)
             if parts == ["diff"]:
                 return self._diff(query)
             if parts and parts[0] == "entities":

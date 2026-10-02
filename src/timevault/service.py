@@ -1,10 +1,22 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from .errors import ConflictError, NotFoundError, ValidationError
-from .model import Correction, Entity, Fact, INFINITY, instant, iso, value_same
+from .errors import ConflictError, NotFoundError, TimeVaultError, ValidationError
+from .model import (
+    BatchCorrect,
+    BatchCreate,
+    Correction,
+    Entity,
+    Fact,
+    INFINITY,
+    instant,
+    iso,
+    parse_batch,
+    value_same,
+)
 from .store import Store
 
 
@@ -255,6 +267,18 @@ def _value_document(entry: tuple[Any, int, str, int, int | None, int] | None) ->
     }
 
 
+def _batch_operation_name(raw: Any) -> str:
+    """The idempotency-operation label for a batch request.
+
+    It is derived from the request body rather than the key, so reusing one
+    idempotency key on a *different* batch is detected the same way reusing it
+    on a single-entity write already is.
+    """
+    payload = Store.encode(raw)
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return f"batch:{digest}"
+
+
 class TimeVault:
     """Bitemporal entity store: valid time on one axis, transaction time on the other."""
 
@@ -274,24 +298,9 @@ class TimeVault:
             valid_from = moment
 
         def action(recorded_at: int) -> dict[str, Any]:
-            if self.store.entity_row(entity.type, entity.id) is not None:
-                raise ConflictError(f"entity {entity.type}/{entity.id} already exists")
-            self.store.insert_entity(entity.type, entity.id, recorded_at)
-            for attribute in entity.attributes:
-                self.store.insert_version(
-                    entity.type,
-                    entity.id,
-                    attribute.name,
-                    1,
-                    "assert",
-                    attribute.value,
-                    valid_from,
-                    None,
-                    recorded_at,
-                )
-            document = self._read(entity.type, entity.id, recorded_at, recorded_at)
-            document["created_at"] = iso(recorded_at)
-            return document
+            return self._create_core(
+                entity.type, entity.id, entity.attributes, valid_from, recorded_at
+            )
 
         return self._idempotent(key, f"create:{entity.type}/{entity.id}", action, moment)
 
@@ -302,23 +311,74 @@ class TimeVault:
         correction = Correction.parse(raw, now)
 
         def action(recorded_at: int) -> dict[str, Any]:
-            row = self.store.entity_row(entity_type, entity_id)
-            if row is None:
-                raise NotFoundError(f"entity {entity_type}/{entity_id} does not exist")
-            if int(row["created_at"]) > recorded_at:
-                raise ConflictError(
-                    f"cannot state a fact about {entity_type}/{entity_id} before it existed"
-                )
-            for fact in correction.facts:
-                self._apply_fact(entity_type, entity_id, fact, recorded_at)
-            # ``as_of`` equal to the instant just recorded means "every window
-            # that starts when this fact takes effect", which describes the
-            # attribute as it stands after the correction rather than the state
-            # that the correction replaced.  A write is never a 404, so an
-            # entity with nothing in effect right now answers with no attributes.
-            return self._read(entity_type, entity_id, recorded_at, recorded_at, required=False)
+            return self._correct_core(entity_type, entity_id, correction, recorded_at)
 
         return self._idempotent(key, f"correct:{entity_type}/{entity_id}", action, now)
+
+    def run_batch(self, raw: Any, key: str | None) -> dict[str, Any]:
+        """Atomically apply an ordered list of creates and corrections.
+
+        Every item shares one transaction instant, so the whole batch is one
+        point on the transaction axis: later items see earlier items' effects,
+        but no outside reader ever sees a partially applied batch.  Any invalid
+        or conflicting item aborts the transaction and nothing is stored.
+        """
+        moment = self.store.now()
+        operations = parse_batch(raw, moment)
+        # Entities this very batch will create, so a correction whose creation
+        # sits later in the array can be told apart from one that names an
+        # entity nobody will ever create: the first is an ordering conflict,
+        # the second is simply not found.
+        created_here = {
+            (item.entity_type, item.entity_id)
+            for item in operations
+            if isinstance(item, BatchCreate)
+        }
+
+        def action(recorded_at: int) -> dict[str, Any]:
+            results: list[dict[str, Any]] = []
+            seen_creates: set[tuple[str, str]] = set()
+            for index, item in enumerate(operations, start=1):
+                target = (item.entity_type, item.entity_id)
+                try:
+                    if isinstance(item, BatchCreate):
+                        start = item.valid_from if item.valid_from is not None else recorded_at
+                        document = self._create_core(
+                            item.entity_type,
+                            item.entity_id,
+                            item.attributes,
+                            start,
+                            recorded_at,
+                        )
+                        seen_creates.add(target)
+                        document["operation"] = "create"
+                    elif isinstance(item, BatchCorrect):
+                        try:
+                            document = self._correct_core(
+                                item.entity_type,
+                                item.entity_id,
+                                item.correction,
+                                recorded_at,
+                            )
+                        except NotFoundError:
+                            if target in created_here and target not in seen_creates:
+                                raise ConflictError(
+                                    f"entity {item.entity_type}/{item.entity_id} is "
+                                    "corrected before it is created"
+                                )
+                            raise
+                        document["operation"] = "correct"
+                    else:  # pragma: no cover - parse_batch only yields the two kinds
+                        raise ValidationError("unknown batch operation")
+                except TimeVaultError as error:
+                    message = str(error)
+                    if not message.startswith("operation "):
+                        raise type(error)(f"operation {index}: {message}") from error
+                    raise
+                results.append(document)
+            return {"recorded_at": iso(recorded_at), "results": results}
+
+        return self._idempotent(key, _batch_operation_name(raw), action, moment)
 
     # -- reads --------------------------------------------------------------
 
@@ -433,6 +493,63 @@ class TimeVault:
         }
 
     # -- internals ----------------------------------------------------------
+
+    def _create_core(
+        self,
+        entity_type: str,
+        entity_id: str,
+        attributes: tuple[Any, ...],
+        valid_from: int,
+        recorded_at: int,
+    ) -> dict[str, Any]:
+        """Insert one entity and its version-1 assertions at a fixed instant."""
+        if self.store.entity_row(entity_type, entity_id) is not None:
+            raise ConflictError(f"entity {entity_type}/{entity_id} already exists")
+        self.store.insert_entity(entity_type, entity_id, recorded_at)
+        for attribute in attributes:
+            self.store.insert_version(
+                entity_type,
+                entity_id,
+                attribute.name,
+                1,
+                "assert",
+                attribute.value,
+                valid_from,
+                None,
+                recorded_at,
+            )
+        document = self._read(entity_type, entity_id, recorded_at, recorded_at)
+        document["created_at"] = iso(recorded_at)
+        return document
+
+    def _correct_core(
+        self,
+        entity_type: str,
+        entity_id: str,
+        correction: Correction,
+        recorded_at: int,
+    ) -> dict[str, Any]:
+        """Apply one already-parsed correction at a fixed transaction instant.
+
+        Raises :class:`NotFoundError` when the entity does not exist yet and
+        :class:`ConflictError` when the correction's facts would land before the
+        entity was recorded.
+        """
+        row = self.store.entity_row(entity_type, entity_id)
+        if row is None:
+            raise NotFoundError(f"entity {entity_type}/{entity_id} does not exist")
+        if int(row["created_at"]) > recorded_at:
+            raise ConflictError(
+                f"cannot state a fact about {entity_type}/{entity_id} before it existed"
+            )
+        for fact in correction.facts:
+            self._apply_fact(entity_type, entity_id, fact, recorded_at)
+        # ``as_of`` equal to the instant just recorded means "every window
+        # that starts when this fact takes effect", which describes the
+        # attribute as it stands after the correction rather than the state
+        # that the correction replaced.  A write is never a 404, so an
+        # entity with nothing in effect right now answers with no attributes.
+        return self._read(entity_type, entity_id, recorded_at, recorded_at, required=False)
 
     def _idempotent(
         self,

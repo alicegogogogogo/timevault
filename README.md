@@ -244,6 +244,82 @@ A fact that would create an empty window (for example a `valid_end` at or before
 the window start) is a `validation_error`, because a version's window is never
 made empty by an ordinary correction.
 
+### Batch import
+
+```http
+POST /batch
+Idempotency-Key: import-1
+
+{
+  "operations": [
+    {"operation": "create", "type": "account", "id": "acct-1",
+     "attributes": {"status": "active", "tier": "gold"},
+     "valid_from": "2024-01-01T00:00:00Z"},
+    {"operation": "correct", "type": "account", "id": "acct-1",
+     "as_of": "2024-03-01T00:00:00Z",
+     "facts": [{"attribute": "tier", "value": "platinum"}]},
+    {"operation": "correct", "type": "account", "id": "acct-1",
+     "facts": [{"attribute": "region", "value": "emea"}]}
+  ]
+}
+```
+
+Returns HTTP 200. The body must be an object containing only an `operations`
+array of between 1 and 1000 items, and the request requires an
+`Idempotency-Key` header. Each item is one of:
+
+- `create` — `type`, `id`, `attributes`, and an optional `valid_from`, with the
+  same field semantics as `POST /entities/{type}`;
+- `correct` — `type`, `id`, optional `as_of`, and `facts`, with the same field
+  semantics as `PUT /entities/{type}/{id}`.
+
+Operations apply in the order given, so a later item sees the result of the
+earlier ones: the same request may create an entity and then correct it, and it
+may append several history segments to an entity that already existed. An item
+that corrects an entity the same batch creates **later** is a `conflict`;
+correcting an entity nobody creates is `not_found`; a duplicate create (against
+an existing entity or an earlier item) is a `conflict`. A batch item that fails
+any check reports the one-based index of the item, for example
+`operation 2: as_of must not be in the future`. Structural and field problems
+are `validation_error`.
+
+The whole batch is one write: it commits at a single transaction instant under
+one transaction, so every version and trim it produces carries the same
+`recorded_at`, and any failing item aborts the entire request — nothing is
+stored and no version numbers are consumed. Different batches submitted
+concurrently commit one after another, so version numbers stay continuous and
+valid windows never overlap; a reader never sees a partially applied batch.
+
+```json
+{"recorded_at": "2024-05-31T00:00:00.000Z",
+ "results": [
+   {"operation": "create", "type": "account", "id": "acct-1",
+    "as_of": "2024-05-31T00:00:00.000Z", "known_at": "2024-05-31T00:00:00.000Z",
+    "created_at": "2024-05-31T00:00:00.000Z",
+    "attributes": {"tier": {"value": "gold", "version": 1, "operation": "assert",
+                            "valid_from": "2024-01-01T00:00:00.000Z",
+                            "valid_end": null,
+                            "recorded_at": "2024-05-31T00:00:00.000Z"}}},
+   {"operation": "correct", "type": "account", "id": "acct-1",
+    "as_of": "2024-05-31T00:00:00.000Z", "known_at": "2024-05-31T00:00:00.000Z",
+    "attributes": {"tier": {"value": "platinum", "version": 2, "operation": "assert",
+                            "valid_from": "2024-03-01T00:00:00.000Z",
+                            "valid_end": null,
+                            "recorded_at": "2024-05-31T00:00:00.000Z"}}}]}
+```
+
+`results` is the same length and order as `operations`. Each result has the
+shape the matching single-entity write would return (a `create` result carries
+`created_at`, a `correct` result does not), plus an `operation` field naming its
+type. The top-level `recorded_at` is the batch's transaction instant in the
+same instant format the rest of the API uses. After the batch returns, the
+ordinary `GET`, `/history`, and `/diff` entry points read the resulting state
+exactly as if each operation had been written individually at that instant.
+
+Replaying a key returns the first batch's stored 200 response and writes
+nothing, so replayed batches add no versions; reusing a key for a different
+batch request is a `conflict`.
+
 ### Read an entity
 
 ```http
