@@ -48,13 +48,13 @@ def make_handler(service: TimeVault) -> type[BaseHTTPRequestHandler]:
             self.end_headers()
             self.wfile.write(body)
 
-        def _body(self) -> Any:
+        def _body(self, max_length: int = 1_000_000) -> Any:
             content_type = self.headers.get("Content-Type", "")
             if content_type.split(";", 1)[0].strip().lower() != "application/json":
                 raise ValidationError("Content-Type must be application/json")
             try:
                 length = int(self.headers.get("Content-Length", "0"))
-                if length < 0 or length > 1_000_000:
+                if length < 0 or length > max_length:
                     raise ValueError
                 return json.loads(self.rfile.read(length))
             except (ValueError, json.JSONDecodeError) as error:
@@ -75,6 +75,8 @@ def make_handler(service: TimeVault) -> type[BaseHTTPRequestHandler]:
             if parts == ["health"] and self.command == "GET":
                 only(query, set())
                 return 200, {"status": "ok"}
+            if parts == ["batch"]:
+                return self._batch(query, key)
             if parts == ["diff"]:
                 return self._diff(query)
             if parts and parts[0] == "entities":
@@ -109,6 +111,14 @@ def make_handler(service: TimeVault) -> type[BaseHTTPRequestHandler]:
                     parts[0], parts[1], self._instant_parameter(query, "known_at")
                 )
             raise NotFoundError("route was not found")
+
+        def _batch(self, query: dict[str, list[str]], key: str | None) -> tuple[int, Any]:
+            if self.command != "POST":
+                raise NotFoundError("route was not found")
+            only(query, set())
+            # Up to a thousand operations need more room than a single write;
+            # the service still enforces the operation count itself.
+            return 200, service.batch(self._body(max_length=10_000_000), key)
 
         def _diff(self, query: dict[str, list[str]]) -> tuple[int, Any]:
             if self.command != "GET":

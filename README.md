@@ -244,6 +244,82 @@ A fact that would create an empty window (for example a `valid_end` at or before
 the window start) is a `validation_error`, because a version's window is never
 made empty by an ordinary correction.
 
+### Batch load
+
+```http
+POST /batch
+Idempotency-Key: load-2024-05-01
+
+{
+  "operations": [
+    {"operation": "create", "type": "account", "id": "acct-1",
+     "attributes": {"status": "active", "tier": "gold"},
+     "valid_from": "2024-01-01T00:00:00Z"},
+    {"operation": "correct", "type": "account", "id": "acct-1",
+     "as_of": "2024-03-01T00:00:00Z",
+     "facts": [{"attribute": "tier", "value": "platinum"}]},
+    {"operation": "correct", "type": "account", "id": "acct-1",
+     "facts": [{"attribute": "region", "value": "emea"}]}
+  ]
+}
+```
+
+The body is a single `operations` array of between 1 and 1000 items, and the
+request requires an `Idempotency-Key` header. Each item is one of:
+
+- `{"operation": "create", "type", "id", "attributes", "valid_from"?}` — field
+  semantics identical to `POST /entities/{type}`;
+- `{"operation": "correct", "type", "id", "as_of"?, "facts"}` — field semantics
+  identical to `PUT /entities/{type}/{id}`; a correction's `as_of` defaults to
+  the batch's transaction time and must not be later than it, and an explicit
+  fact `valid_end` must not precede that fact's `valid_from`.
+
+Operations are processed in the order given: a later item sees what an earlier
+one wrote, so one batch may create an entity and then correct it, or append
+several history segments to an entity that already existed. The whole batch is
+one bitemporal write and commits at a single transaction instant, returned at
+the top level as `recorded_at`. Every row it writes — across all entities and
+all operations — carries that same instant, so version numbers, `declared_end`,
+`valid_end`, `truncations`, and `superseded_at` have exactly the meaning the
+single-entity writes give them.
+
+Returns HTTP 200:
+
+```json
+{"recorded_at": "2024-05-01T00:00:00.000Z",
+ "results": [
+   {"operation": "create", "type": "account", "id": "acct-1",
+    "as_of": "2024-05-01T00:00:00.000Z", "known_at": "2024-05-01T00:00:00.000Z",
+    "created_at": "2024-05-01T00:00:00.000Z",
+    "attributes": {"...": "the same document a single create returns"}},
+   {"operation": "correct", "type": "account", "id": "acct-1",
+    "as_of": "2024-05-01T00:00:00.000Z", "known_at": "2024-05-01T00:00:00.000Z",
+    "attributes": {"...": "the same document a single correction returns"}}]}
+```
+
+`results` is the same length as `operations` and in the same order; each entry
+is the corresponding create or correction response with an added `operation`
+field. Afterwards `GET`, `/history`, and `/diff` read the resulting ledger
+through their ordinary entry points.
+
+The commit is atomic: if any operation fails, nothing in the batch is stored.
+Structural and field problems are `validation_error` (400), a correction (or
+diff-style read target) naming an entity that does not exist is `not_found`
+(404), and a duplicate create, a correction whose matching create appears only
+later in the same batch, or an idempotency key already used for a different
+batch (or single) request is `conflict` (409). An operation-level message names
+its one-based slot, for example `operation 2: entity account/acct-1 already
+exists`; errors in the request envelope itself (a missing key, a missing or
+oversized `operations` array, an unknown top-level field) are not indexed.
+
+Replaying the same `Idempotency-Key` with the identical request body returns
+the first 200 response verbatim and writes no new versions; the same key with a
+different body is a `conflict`, because the key identifies one request, not one
+endpoint. Concurrent batches with different keys are serialised whole: they
+commit one after another, so per-attribute version numbers stay consecutive,
+valid windows never overlap, and a concurrent read observes either the entire
+batch or none of it.
+
 ### Read an entity
 
 ```http

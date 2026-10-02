@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,9 +28,17 @@ class Store:
         if path != ":memory:":
             Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.clock = clock or (lambda: datetime.now(timezone.utc))
+        # One connection is shared by every worker thread, so without an
+        # application-level lock two writes interleave on the same transaction
+        # and a read could follow another thread's cursor straight through its
+        # uncommitted statements.  The lock serialises whole writes against each
+        # other and against reads, which is what keeps a multi-operation batch
+        # all-or-nothing to concurrent readers.
+        self._lock = threading.RLock()
         self.connection = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
         self.connection.row_factory = sqlite3.Row
         self.connection.execute("PRAGMA journal_mode = WAL")
+        self.connection.execute("PRAGMA busy_timeout = 5000")
         self.connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS entities (
@@ -73,14 +82,33 @@ class Store:
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
-        self.connection.execute("BEGIN IMMEDIATE")
-        try:
+        # Held across BEGIN..COMMIT: two concurrent writes queue here and commit
+        # one after another, so per-attribute version numbers stay consecutive
+        # and no reader can slip in between a batch's statements.
+        with self._lock:
+            self.connection.execute("BEGIN IMMEDIATE")
+            try:
+                yield self.connection
+            except Exception:
+                self.connection.execute("ROLLBACK")
+                raise
+            else:
+                self.connection.execute("COMMIT")
+
+    @contextmanager
+    def reading(self) -> Iterator[sqlite3.Connection]:
+        """Take the same lock a write transaction takes.
+
+        Every thread shares one connection, and sqlite exposes an
+        uncommitted transaction on that connection.  Without waiting here a
+        reader could follow another thread's cursor straight through an
+        in-flight batch and observe a partial commit.  The RLock is re-entrant,
+        so a read performed from inside a write transaction (building its own
+        response) does not deadlock; standalone reads simply queue behind a
+        commit and see either the whole batch or none.
+        """
+        with self._lock:
             yield self.connection
-        except Exception:
-            self.connection.execute("ROLLBACK")
-            raise
-        else:
-            self.connection.execute("COMMIT")
 
     def now(self) -> int:
         """Current instant as integer milliseconds since the Unix epoch."""

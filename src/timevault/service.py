@@ -1,11 +1,39 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from .errors import ConflictError, NotFoundError, ValidationError
-from .model import Correction, Entity, Fact, INFINITY, instant, iso, value_same
+from .errors import ConflictError, NotFoundError, TimeVaultError, ValidationError
+from .model import Correction, Entity, Fact, INFINITY, identifier, instant, iso, value_same
 from .store import Store
+
+# A batch is one atomic initial-load request, capped so validation and the
+# all-or-nothing commit stay cheap.
+MAX_BATCH_OPERATIONS = 1_000
+
+# Idempotency labels for batch requests are derived from content, never from
+# the caller's key, so one key reused for a different payload is detectable.
+_BATCH_LABEL_PREFIX = "batch:"
+
+
+@dataclass(frozen=True)
+class PreparedCreate:
+    """A validated create that has not touched the ledger."""
+
+    entity: Entity
+    valid_from: int
+
+
+# A validated batch item: either ("create", PreparedCreate) or
+# ("correct", type, id, Correction).
+PreparedOperation = tuple[Any, ...]
+
+
+def _content_fingerprint(raw: Any) -> str:
+    """Stable digest of a batch request's canonical payload."""
+    canonical = Store.encode(raw)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -265,35 +293,12 @@ class TimeVault:
 
     def create_entity(self, entity_type: str, raw: Any, key: str | None) -> dict[str, Any]:
         moment = self.store.now()
-        entity = Entity.parse(entity_type, raw)
-        if "valid_from" in raw:
-            valid_from = instant(raw["valid_from"], "valid_from")
-            if valid_from > moment:
-                raise ValidationError("valid_from must not be in the future")
-        else:
-            valid_from = moment
+        prepared = self._prepare_create(entity_type, raw, moment)
 
         def action(recorded_at: int) -> dict[str, Any]:
-            if self.store.entity_row(entity.type, entity.id) is not None:
-                raise ConflictError(f"entity {entity.type}/{entity.id} already exists")
-            self.store.insert_entity(entity.type, entity.id, recorded_at)
-            for attribute in entity.attributes:
-                self.store.insert_version(
-                    entity.type,
-                    entity.id,
-                    attribute.name,
-                    1,
-                    "assert",
-                    attribute.value,
-                    valid_from,
-                    None,
-                    recorded_at,
-                )
-            document = self._read(entity.type, entity.id, recorded_at, recorded_at)
-            document["created_at"] = iso(recorded_at)
-            return document
+            return self._execute_create(prepared, recorded_at)
 
-        return self._idempotent(key, f"create:{entity.type}/{entity.id}", action, moment)
+        return self._idempotent(key, f"create:{prepared.entity.type}/{prepared.entity.id}", action, moment)
 
     def apply_correction(
         self, entity_type: str, entity_id: str, raw: Any, key: str | None
@@ -302,23 +307,181 @@ class TimeVault:
         correction = Correction.parse(raw, now)
 
         def action(recorded_at: int) -> dict[str, Any]:
-            row = self.store.entity_row(entity_type, entity_id)
-            if row is None:
-                raise NotFoundError(f"entity {entity_type}/{entity_id} does not exist")
-            if int(row["created_at"]) > recorded_at:
-                raise ConflictError(
-                    f"cannot state a fact about {entity_type}/{entity_id} before it existed"
-                )
-            for fact in correction.facts:
-                self._apply_fact(entity_type, entity_id, fact, recorded_at)
-            # ``as_of`` equal to the instant just recorded means "every window
-            # that starts when this fact takes effect", which describes the
-            # attribute as it stands after the correction rather than the state
-            # that the correction replaced.  A write is never a 404, so an
-            # entity with nothing in effect right now answers with no attributes.
-            return self._read(entity_type, entity_id, recorded_at, recorded_at, required=False)
+            return self._execute_correction(entity_type, entity_id, correction, recorded_at)
 
         return self._idempotent(key, f"correct:{entity_type}/{entity_id}", action, now)
+
+    def batch(self, raw: Any, key: str | None) -> dict[str, Any]:
+        """Atomically load several creates and corrections at one instant.
+
+        Operations run in the order given, each one seeing the state the earlier
+        ones leave, but the whole batch is one transaction-time write: it either
+        commits together or leaves no trace.
+        """
+        moment = self.store.now()
+        operations = self._parse_batch(raw, moment)
+
+        def action(recorded_at: int) -> dict[str, Any]:
+            results: list[dict[str, Any]] = []
+            # Targets a later operation still intends to create; a correction of
+            # one of those is a "correct before create" conflict rather than a
+            # not-found, because the entity is only missing so far.
+            future_creates = {
+                (item[1].entity.type, item[1].entity.id)
+                for item in operations
+                if item[0] == "create"
+            }
+            for index, prepared in enumerate(operations, start=1):
+                try:
+                    if prepared[0] == "create":
+                        target = (prepared[1].entity.type, prepared[1].entity.id)
+                        future_creates.discard(target)
+                        result = self._execute_create(prepared[1], recorded_at)
+                        result["operation"] = "create"
+                    else:
+                        entity_type, entity_id = prepared[1], prepared[2]
+                        try:
+                            result = self._execute_correction(
+                                entity_type, entity_id, prepared[3], recorded_at
+                            )
+                        except NotFoundError:
+                            if (entity_type, entity_id) in future_creates:
+                                raise ConflictError(
+                                    f"entity {entity_type}/{entity_id} is corrected before it is "
+                                    "created; its create comes later in this batch"
+                                )
+                            raise
+                        result["operation"] = "correct"
+                except TimeVaultError as error:
+                    # The caller locates the failing item by its one-based slot;
+                    # every error in a batch is an operation error.
+                    raise error.__class__(f"operation {index}: {error}") from error
+                results.append(result)
+            return {"recorded_at": iso(recorded_at), "results": results}
+
+        # The label is derived from the canonical request body rather than from
+        # the key: a key replayed against a different batch is then a conflict,
+        # not a second successful batch.
+        label = _BATCH_LABEL_PREFIX + _content_fingerprint(raw)
+        return self._idempotent(key, label, action, moment)
+
+    # -- batch internals ----------------------------------------------------
+
+    def _prepare_create(self, entity_type: str, raw: Any, moment: int) -> "PreparedCreate":
+        entity = Entity.parse(entity_type, raw)
+        if "valid_from" in raw:
+            valid_from = instant(raw["valid_from"], "valid_from")
+            if valid_from > moment:
+                raise ValidationError("valid_from must not be in the future")
+        else:
+            valid_from = moment
+        return PreparedCreate(entity, valid_from)
+
+    def _execute_create(self, prepared: "PreparedCreate", recorded_at: int) -> dict[str, Any]:
+        entity = prepared.entity
+        if self.store.entity_row(entity.type, entity.id) is not None:
+            raise ConflictError(f"entity {entity.type}/{entity.id} already exists")
+        self.store.insert_entity(entity.type, entity.id, recorded_at)
+        for attribute in entity.attributes:
+            self.store.insert_version(
+                entity.type,
+                entity.id,
+                attribute.name,
+                1,
+                "assert",
+                attribute.value,
+                prepared.valid_from,
+                None,
+                recorded_at,
+            )
+        document = self._read(entity.type, entity.id, recorded_at, recorded_at)
+        document["created_at"] = iso(recorded_at)
+        return document
+
+    def _execute_correction(
+        self,
+        entity_type: str,
+        entity_id: str,
+        correction: Correction,
+        recorded_at: int,
+    ) -> dict[str, Any]:
+        row = self.store.entity_row(entity_type, entity_id)
+        if row is None:
+            raise NotFoundError(f"entity {entity_type}/{entity_id} does not exist")
+        if int(row["created_at"]) > recorded_at:
+            raise ConflictError(
+                f"cannot state a fact about {entity_type}/{entity_id} before it existed"
+            )
+        for fact in correction.facts:
+            self._apply_fact(entity_type, entity_id, fact, recorded_at)
+        # ``as_of`` equal to the instant just recorded means "every window
+        # that starts when this fact takes effect", which describes the
+        # attribute as it stands after the correction rather than the state
+        # that the correction replaced.  A write is never a 404, so an
+        # entity with nothing in effect right now answers with no attributes.
+        return self._read(entity_type, entity_id, recorded_at, recorded_at, required=False)
+
+    def _parse_batch(self, raw: Any, moment: int) -> list["PreparedOperation"]:
+        if not isinstance(raw, dict):
+            raise ValidationError("request body must be a JSON object")
+        unknown = sorted(set(raw) - {"operations"})
+        if unknown:
+            raise ValidationError(f"unknown field(s): {', '.join(unknown)}")
+        operations = raw.get("operations")
+        if not isinstance(operations, list):
+            raise ValidationError("operations must be an array")
+        if not operations:
+            raise ValidationError("operations must contain at least one item")
+        if len(operations) > MAX_BATCH_OPERATIONS:
+            raise ValidationError(f"operations must contain at most {MAX_BATCH_OPERATIONS} items")
+
+        prepared: list[PreparedOperation] = []
+        for index, item in enumerate(operations, start=1):
+            try:
+                prepared.append(self._parse_operation(item, moment))
+            except TimeVaultError as error:
+                raise error.__class__(f"operation {index}: {error}") from error
+        return prepared
+
+    def _parse_operation(self, item: Any, moment: int) -> "PreparedOperation":
+        if not isinstance(item, dict):
+            raise ValidationError("each operation must be a JSON object")
+        kind = item.get("operation")
+        if kind not in ("create", "correct"):
+            raise ValidationError("operation must be \"create\" or \"correct\"")
+        allowed = {"operation", "type", "id"}
+        if kind == "create":
+            allowed |= {"attributes", "valid_from"}
+        else:
+            allowed |= {"as_of", "facts"}
+        unknown = sorted(set(item) - allowed)
+        if unknown:
+            raise ValidationError(f"unknown field(s): {', '.join(unknown)}")
+        if "type" not in item:
+            raise ValidationError("type is required")
+        if "id" not in item:
+            raise ValidationError("id is required")
+        entity_type = identifier(item["type"], "entity type")
+        entity_id = identifier(item["id"], "entity id")
+        if kind == "create":
+            # Reuse the single-entity parser, including its field semantics and
+            # the ``id``/``attributes`` requirements; ``type`` comes from the
+            # operation envelope (as it does from the URL path) and
+            # ``operation`` is batch-only, so neither belongs in the inner body.
+            body = {key: value for key, value in item.items() if key not in ("operation", "type")}
+            return ("create", self._prepare_create(entity_type, body, moment))
+
+        # Checked before Correction.parse so the batch wording states the rule
+        # the batch adds (the standalone correction also rejects the future).
+        if "as_of" in item:
+            as_of = instant(item["as_of"], "as_of")
+            if as_of > moment:
+                raise ValidationError("as_of must not be later than recorded_at")
+        body: dict[str, Any] = {"facts": item.get("facts")}
+        if "as_of" in item:
+            body["as_of"] = item["as_of"]
+        correction = Correction.parse(body, moment)
+        return ("correct", entity_type, entity_id, correction)
 
     # -- reads --------------------------------------------------------------
 
@@ -336,35 +499,37 @@ class TimeVault:
         3339 string or an integer count of epoch milliseconds.
         """
         moment = self.store.now()
-        return self._read(
-            entity_type,
-            entity_id,
-            moment if as_of is None else instant(as_of, "as_of"),
-            moment if known_at is None else instant(known_at, "known_at"),
-        )
+        with self.store.reading():
+            return self._read(
+                entity_type,
+                entity_id,
+                moment if as_of is None else instant(as_of, "as_of"),
+                moment if known_at is None else instant(known_at, "known_at"),
+            )
 
     def history(
         self, entity_type: str, entity_id: str, known_at: Any = None
     ) -> dict[str, Any]:
-        row = self.store.entity_row(entity_type, entity_id)
-        if row is None:
-            raise NotFoundError(f"entity {entity_type}/{entity_id} does not exist")
         if known_at is None:
             known_at = self.store.now()
         else:
             known_at = instant(known_at, "known_at")
-        grouped = self._grouped_versions(entity_type, entity_id)
-        attributes = []
-        for name in sorted(grouped):
-            tokens = complete_windows(grouped[name], known_at)
-            attributes.append(
-                {
-                    "attribute": name,
-                    "versions": [
-                        version.as_dict(valid_end) for version, _, valid_end in tokens
-                    ],
-                }
-            )
+        with self.store.reading():
+            row = self.store.entity_row(entity_type, entity_id)
+            if row is None:
+                raise NotFoundError(f"entity {entity_type}/{entity_id} does not exist")
+            grouped = self._grouped_versions(entity_type, entity_id)
+            attributes = []
+            for name in sorted(grouped):
+                tokens = complete_windows(grouped[name], known_at)
+                attributes.append(
+                    {
+                        "attribute": name,
+                        "versions": [
+                            version.as_dict(valid_end) for version, _, valid_end in tokens
+                        ],
+                    }
+                )
         return {
             "type": entity_type,
             "id": entity_id,
@@ -389,15 +554,16 @@ class TimeVault:
             raise ValidationError("to must be strictly later than from")
         if names is not None and len(set(names)) != len(names):
             raise ValidationError("attribute may not be repeated")
-        left = self._projection(entity_type, entity_id, start, known_at)
-        right = self._projection(entity_type, entity_id, end, known_at)
-        selected = sorted(set(left) | set(right))
-        if names is not None:
-            wanted = set(names)
-            unknown = sorted(wanted - set(self._all_attributes(entity_type, entity_id)))
-            if unknown:
-                raise ValidationError(f"unknown attribute(s): {', '.join(unknown)}")
-            selected = [name for name in selected if name in wanted]
+        with self.store.reading():
+            left = self._projection(entity_type, entity_id, start, known_at)
+            right = self._projection(entity_type, entity_id, end, known_at)
+            selected = sorted(set(left) | set(right))
+            if names is not None:
+                wanted = set(names)
+                unknown = sorted(wanted - set(self._all_attributes(entity_type, entity_id)))
+                if unknown:
+                    raise ValidationError(f"unknown attribute(s): {', '.join(unknown)}")
+                selected = [name for name in selected if name in wanted]
 
         changes = []
         for name in selected:
