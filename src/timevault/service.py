@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -12,6 +14,7 @@ from .model import (
     Entity,
     Fact,
     INFINITY,
+    attribute_name,
     identifier,
     instant,
     iso,
@@ -297,6 +300,130 @@ def _batch_operation_name(raw: Any) -> str:
     payload = Store.encode(raw)
     digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
     return f"batch:{digest}"
+
+
+def _parse_limit(value: Any) -> int:
+    """Parse the audit page size (default 100, range 1..500)."""
+    if value is None:
+        return 100
+    if isinstance(value, bool):
+        raise ValidationError("limit must be an integer between 1 and 500")
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, str) and value.strip().isdigit():
+        parsed = int(value.strip())
+    else:
+        raise ValidationError("limit must be an integer between 1 and 500")
+    if not 1 <= parsed <= 500:
+        raise ValidationError("limit must be an integer between 1 and 500")
+    return parsed
+
+
+def _audit_item(row: Any) -> dict[str, Any]:
+    """Render one union row as a public audit item."""
+    event_seq = int(row["event_seq"])
+    item = {
+        "event_id": f"evt_{event_seq:020d}",
+        "recorded_at": iso(int(row["recorded_at"])),
+        "type": str(row["type"]),
+        "id": str(row["id"]),
+        "attribute": str(row["attribute"]),
+        "version": int(row["version"]),
+        "action": str(row["action"]),
+    }
+    if item["action"] == "version_appended":
+        operation = str(row["operation"])
+        # A retraction and an assertion of the JSON value null both store no
+        # scalar text; the operation column tells them apart, and in either
+        # case the reported value is null, which is what both committed with.
+        item["operation"] = operation
+        item["value"] = None if row["value"] is None else Store.decode(row["value"])
+        item["valid_from"] = iso(int(row["valid_from"]))
+        declared = row["declared_end"]
+        if operation == "retract" or declared is None:
+            # A retraction declares no end: its equal valid_from/valid_end only
+            # describe the intentionally empty window.
+            item["declared_end"] = None
+        else:
+            item["declared_end"] = iso(int(declared))
+    else:
+        item["valid_end"] = iso(int(row["trunc_valid_end"]))
+    return item
+
+
+# An audit cursor is an opaque, self-contained description of one fixed result
+# set: the high-water sequence pinning its upper bound, the keyset position the
+# next page starts after, and the filters the first query was made with.  It is
+# base64url-encoded JSON; a cursor that does not decode into exactly this shape
+# is treated as unknown or corrupt rather than as a fresh query.
+_CURSOR_VERSION = 1
+_CURSOR_FILTER_KEYS = ("t", "i", "a", "c", "rf", "rt")
+
+
+def _encode_cursor(
+    high_seq: int, after_recorded_at: int, after_event_seq: int, filters: dict[str, Any]
+) -> str:
+    payload = {
+        "v": _CURSOR_VERSION,
+        "h": high_seq,
+        "r": after_recorded_at,
+        "s": after_event_seq,
+        "f": [filters[key] for key in _CURSOR_FILTER_KEYS],
+    }
+    raw = Store.encode(payload).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _decode_cursor(text: Any) -> dict[str, Any]:
+    if not isinstance(text, str) or not text or len(text) > 4096:
+        raise ValidationError("cursor is unknown or malformed")
+    try:
+        padded = text + "=" * (-len(text) % 4)
+        payload = Store.decode(base64.urlsafe_b64decode(padded.encode("ascii")))
+    except (binascii.Error, ValueError, UnicodeDecodeError) as error:
+        raise ValidationError("cursor is unknown or malformed") from error
+    message = "cursor is unknown or malformed"
+    if not isinstance(payload, dict) or set(payload) != {"v", "h", "r", "s", "f"}:
+        raise ValidationError(message)
+    if payload["v"] != _CURSOR_VERSION:
+        raise ValidationError(message)
+
+    def nonnegative(name: str) -> int:
+        value = payload[name]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValidationError(message)
+        return value
+
+    high_seq, after_recorded_at, after_event_seq = (
+        nonnegative("h"),
+        nonnegative("r"),
+        nonnegative("s"),
+    )
+    if after_event_seq < 1 or after_event_seq > high_seq:
+        raise ValidationError(message)
+    raw_filters = payload["f"]
+    if not isinstance(raw_filters, list) or len(raw_filters) != len(_CURSOR_FILTER_KEYS):
+        raise ValidationError(message)
+    filters = dict(zip(_CURSOR_FILTER_KEYS, raw_filters))
+    for key in ("t", "i", "a", "c"):
+        if filters[key] is not None and not isinstance(filters[key], str):
+            raise ValidationError(message)
+    if filters["c"] not in (None, "version_appended", "window_truncated"):
+        raise ValidationError(message)
+    for key in ("rf", "rt"):
+        value = filters[key]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            if value is not None:
+                raise ValidationError(message)
+    start, end = filters["rf"], filters["rt"]
+    if start is not None and end is not None and start >= end:
+        raise ValidationError(message)
+    return {
+        "h": high_seq,
+        "r": after_recorded_at,
+        "s": after_event_seq,
+        "f": filters,
+    }
 
 
 class TimeVault:
@@ -589,6 +716,111 @@ class TimeVault:
             "removed": removed,
             "changed": changed,
         }
+
+    # -- audit --------------------------------------------------------------
+
+    def audit(
+        self,
+        *,
+        entity_type: Any = None,
+        entity_id: Any = None,
+        attribute: Any = None,
+        action: Any = None,
+        recorded_from: Any = None,
+        recorded_to: Any = None,
+        limit: Any = None,
+        cursor: str | None = None,
+    ) -> dict[str, Any]:
+        """Return committed ledger events as an append-only audit trail.
+
+        Every committed version append is one ``version_appended`` item and
+        every window truncation one ``window_truncated`` item, ordered by
+        ``recorded_at`` ascending and, inside one millisecond, by the stable
+        unique ``event_seq`` drawn at commit time.  The query is read-only: it
+        appends no versions and no truncations, and a rolled-back or replayed
+        write has nothing committed, so neither produces an item.
+
+        The first page pins a high-water mark, ``high_seq``: events committed
+        afterwards by a concurrent writer carry a larger sequence and can never
+        enter this trail's later pages, so paging can neither repeat nor skip an
+        item.  The mark, the keyset position, and the filters travel inside the
+        opaque cursor; a cursor request may change only ``limit``.
+        """
+        page_limit = _parse_limit(limit)
+        if cursor is not None:
+            if any(
+                value is not None
+                for value in (
+                    entity_type,
+                    entity_id,
+                    attribute,
+                    action,
+                    recorded_from,
+                    recorded_to,
+                )
+            ):
+                raise ValidationError("a cursor request may only carry cursor and limit")
+            mark = _decode_cursor(cursor)
+            high_seq = mark["h"]
+            after_recorded_at = mark["r"]
+            after_event_seq = mark["s"]
+            filters = mark["f"]
+        else:
+            filters = self._audit_filters(
+                entity_type, entity_id, attribute, action, recorded_from, recorded_to
+            )
+            # The high-water mark is read together with nothing else pending, so
+            # it is the highest committed sequence at query time; a write that
+            # commits later stays out of every page of this trail.
+            high_seq = self.store.max_event_seq()
+            after_recorded_at = None
+            after_event_seq = None
+
+        rows = self.store.audit_events(
+            high_seq=high_seq,
+            limit=page_limit,
+            after_recorded_at=after_recorded_at,
+            after_event_seq=after_event_seq,
+            recorded_from=filters["rf"],
+            recorded_to=filters["rt"],
+            entity_type=filters["t"],
+            entity_id=filters["i"],
+            attribute=filters["a"],
+            action=filters["c"],
+        )
+        items = [_audit_item(row) for row in rows[:page_limit]]
+        next_cursor: str | None = None
+        if len(rows) > page_limit:
+            last = rows[page_limit - 1]
+            next_cursor = _encode_cursor(
+                high_seq, int(last["recorded_at"]), int(last["event_seq"]), filters
+            )
+        return {"items": items, "next_cursor": next_cursor}
+
+    @staticmethod
+    def _audit_filters(
+        entity_type: Any,
+        entity_id: Any,
+        attribute: Any,
+        action: Any,
+        recorded_from: Any,
+        recorded_to: Any,
+    ) -> dict[str, Any]:
+        """Validate the filter set of a first audit query and normalise it."""
+        if entity_id is not None and entity_type is None:
+            raise ValidationError("filtering by id requires type as well")
+        type_name = None if entity_type is None else identifier(entity_type, "type")
+        entity = None if entity_id is None else identifier(entity_id, "id")
+        name = None if attribute is None else attribute_name(attribute)
+        if action is not None and action not in ("version_appended", "window_truncated"):
+            raise ValidationError(
+                "action must be version_appended or window_truncated"
+            )
+        start = None if recorded_from is None else instant(recorded_from, "recorded_from")
+        end = None if recorded_to is None else instant(recorded_to, "recorded_to")
+        if start is not None and end is not None and start >= end:
+            raise ValidationError("recorded_from must be earlier than recorded_to")
+        return {"t": type_name, "i": entity, "a": name, "c": action, "rf": start, "rt": end}
 
     # -- internals ----------------------------------------------------------
 

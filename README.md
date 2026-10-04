@@ -487,6 +487,78 @@ error. The query is read-only: it appends no versions and moves no transaction
 time, and data written through `POST /batch` takes part in the same computation
 as data written one request at a time.
 
+### Audit the ledger
+
+```http
+GET /audit?type=account&id=acct-1&recorded_from=2024-05-01T00:00:00Z&limit=50
+```
+
+The audit trail makes the ledger itself traceable. Every committed write is
+expanded into independent items: each appended version is one
+`version_appended` item and each window truncation one `window_truncated` item,
+in the order the ledger learned them. The query is read-only — it appends no
+versions and no truncations — and records written through `POST /batch` appear
+exactly as records written one request at a time.
+
+| parameter | meaning |
+| --- | --- |
+| `type` | only events of this entity type |
+| `id` | only events of this entity id; requires `type` |
+| `attribute` | only events touching this attribute |
+| `action` | `version_appended` or `window_truncated` |
+| `recorded_from` | only events recorded at or after this instant (inclusive) |
+| `recorded_to` | only events recorded before this instant (exclusive) |
+| `limit` | page size, default 100, range 1 to 500 |
+| `cursor` | continue a previously started trail |
+
+The time bounds accept the same instant forms as `as_of`/`known_at` and are
+interpreted as the half-open interval `[recorded_from, recorded_to)`. A legal
+scope that nothing falls in is not an error: the response is HTTP 200 with an
+empty `items` array.
+
+Items are ordered by `recorded_at` ascending; inside one millisecond the order
+is fixed by a stable, unique, never-reused `event_id`, so the order does not
+change when the process restarts. `event_id` values are strings of the form
+`evt_00000000000000000042`; treat them as opaque apart from their ordering.
+Every item carries `event_id`, `recorded_at`, `type`, `id`, `attribute`,
+`version`, and `action`. A `version_appended` item additionally carries the
+fields the version committed with — `operation`, `value`, `valid_from`, and
+`declared_end` (a retraction carries `operation: "retract"` and `value: null`);
+a `window_truncated` item carries the `valid_end` that trim learned. Older
+items are never rewritten by a later correction: a window trimmed twice yields
+two truncation items, each keeping the bound it learned. The `type`, `id`,
+`attribute`, and `version` of an item identify exactly the row a plain read or
+the history shows.
+
+```json
+{"items": [
+   {"event_id": "evt_00000000000000000001",
+    "recorded_at": "2024-05-01T00:00:00.000Z",
+    "type": "account", "id": "acct-1", "attribute": "tier", "version": 1,
+    "action": "version_appended", "operation": "assert", "value": "gold",
+    "valid_from": "2024-01-01T00:00:00.000Z", "declared_end": null},
+   {"event_id": "evt_00000000000000000003",
+    "recorded_at": "2024-05-31T00:00:00.000Z",
+    "type": "account", "id": "acct-1", "attribute": "tier", "version": 1,
+    "action": "window_truncated", "valid_end": "2024-03-01T00:00:00.000Z"}],
+ "next_cursor": "eyJ2IjoxLCAiaCI6IDQyLCAiciI6IDE3MTcx…"}
+```
+
+The first query fixes the result set's upper bound and remembers the filters
+inside an opaque `next_cursor`. Events committed afterwards by a concurrent
+writer carry later `event_id`s and can never enter that trail's later pages, so
+following the cursors can neither repeat nor skip an item. A request carrying a
+`cursor` may change only `limit`; repeating any other filter alongside it is a
+`validation_error`. The final page carries `"next_cursor": null`. An unknown or
+corrupt cursor is a `validation_error`, never a fresh first page.
+
+A write that fails or rolls back produces no items and consumes no `event_id`
+values, and replaying an idempotency key returns the first response without
+adding new items. The items one successful batch produces all share that
+batch's single `recorded_at`. Records already present in a database created
+before this entry point existed are included: they are given stable event ids
+once, deterministically, the first time the database is opened.
+
 ## Errors
 
 ```json

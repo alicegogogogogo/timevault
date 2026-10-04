@@ -57,6 +57,7 @@ class Store:
               valid_end INTEGER,
               declared_end INTEGER,
               recorded_at INTEGER NOT NULL,
+              event_seq INTEGER,
               PRIMARY KEY (type, id, attribute, version)
             );
             CREATE INDEX IF NOT EXISTS versions_by_attribute
@@ -67,7 +68,8 @@ class Store:
               attribute TEXT NOT NULL,
               version INTEGER NOT NULL,
               recorded_at INTEGER NOT NULL,
-              valid_end INTEGER NOT NULL
+              valid_end INTEGER NOT NULL,
+              event_seq INTEGER
             );
             CREATE INDEX IF NOT EXISTS truncations_by_version
               ON truncations(type, id, attribute, version, recorded_at);
@@ -78,6 +80,102 @@ class Store:
             );
             """
         )
+        self._migrate_audit()
+
+    def _migrate_audit(self) -> None:
+        """Give every ledger event a stable, unique, never-reused event sequence.
+
+        ``event_seq`` orders audit items inside one ``recorded_at`` millisecond:
+        every committed version append and every window truncation draws one
+        value from one process-wide counter, in commit order, so the audit trail
+        has a total order that survives a restart.  A database written before
+        the audit entry point existed has no sequences yet; its rows are
+        backfilled once here in a deterministic order that matches the order
+        they were committed in, and a partial backfill (interrupted rows carry
+        NULL) is finished before any new sequence is handed out, so every value
+        stays unique and the same database always maps to the same sequence.
+        """
+        with self.lock:
+            columns = {
+                str(row["name"])
+                for row in self.connection.execute("PRAGMA table_info(versions)")
+            }
+            if "event_seq" not in columns:
+                self.connection.execute("ALTER TABLE versions ADD COLUMN event_seq INTEGER")
+            columns = {
+                str(row["name"])
+                for row in self.connection.execute("PRAGMA table_info(truncations)")
+            }
+            if "event_seq" not in columns:
+                self.connection.execute("ALTER TABLE truncations ADD COLUMN event_seq INTEGER")
+            row = self.connection.execute(
+                """
+                SELECT COALESCE(MAX(seq), 0) AS high FROM (
+                  SELECT MAX(event_seq) AS seq FROM versions
+                  UNION ALL
+                  SELECT MAX(event_seq) AS seq FROM truncations
+                )
+                """
+            ).fetchone()
+            next_seq = int(row["high"]) + 1
+            # Versions committed in one write share one ``recorded_at``; the
+            # per-attribute version counter and the stable attribute name fix
+            # their order inside that millisecond, matching the order the
+            # commit inserted them in.  ``rowid`` is the final tie-break: it is
+            # assigned in insertion order, so rows that look identical on every
+            # other key still keep their true commit order.
+            next_seq = self._backfill_event_seq(
+                """
+                SELECT rowid AS rid
+                  FROM versions
+                 WHERE event_seq IS NULL
+                 ORDER BY recorded_at,
+                          type, id,
+                          version,
+                          attribute,
+                          rowid
+                """,
+                "versions",
+                next_seq,
+            )
+            # Several trims of one version commit in the order the corrections
+            # landed; a later trim pulls the window to an earlier instant, so
+            # among trims sharing one millisecond the larger bound is the
+            # earlier commit.  Same-millisecond supersede rows can carry the
+            # same bound, where ``rowid`` preserves the true insertion order.
+            next_seq = self._backfill_event_seq(
+                """
+                SELECT rowid AS rid
+                  FROM truncations
+                 WHERE event_seq IS NULL
+                 ORDER BY recorded_at,
+                          type, id, version,
+                          valid_end DESC,
+                          attribute,
+                          rowid
+                """,
+                "truncations",
+                next_seq,
+            )
+            self.connection.execute(
+                "CREATE INDEX IF NOT EXISTS versions_by_event "
+                "ON versions(recorded_at, event_seq)"
+            )
+            self.connection.execute(
+                "CREATE INDEX IF NOT EXISTS truncations_by_event "
+                "ON truncations(recorded_at, event_seq)"
+            )
+
+    def _backfill_event_seq(
+        self, select_sql: str, table: str, next_seq: int
+    ) -> int:
+        rows = self.connection.execute(select_sql).fetchall()
+        for offset, row in enumerate(rows):
+            self.connection.execute(
+                f"UPDATE {table} SET event_seq = ? WHERE rowid = ?",
+                (next_seq + offset, int(row["rid"])),
+            )
+        return next_seq + len(rows)
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
@@ -293,14 +391,39 @@ class Store:
                 (entity_type, entity_id, attribute, version, recorded_at, at)
             )
         if events:
+            # Draw one base and number the batch locally: the rows are only
+            # inserted after every sequence is chosen, so asking the ledger for
+            # the next value per event would read the same maximum each time.
+            base = self.next_event_seq()
+            numbered = [(*event, base + offset) for offset, event in enumerate(events)]
             self.connection.executemany(
                 """
-                INSERT INTO truncations(type, id, attribute, version, recorded_at, valid_end)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO truncations(type, id, attribute, version, recorded_at, valid_end,
+                                        event_seq)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                events,
+                numbered,
             )
         return events
+
+    def next_event_seq(self) -> int:
+        """Draw the next process-wide audit event sequence.
+
+        Called only inside a write transaction, so the values are handed out in
+        commit order with no gaps; they never wrap and a rolled-back transaction
+        discards the values it drew, which is safe because no committed row ever
+        saw them.
+        """
+        row = self.connection.execute(
+            """
+            SELECT COALESCE(MAX(seq), 0) + 1 AS next FROM (
+              SELECT MAX(event_seq) AS seq FROM versions
+              UNION ALL
+              SELECT MAX(event_seq) AS seq FROM truncations
+            )
+            """
+        ).fetchone()
+        return int(row["next"])
 
     def insert_version(
         self,
@@ -313,12 +436,16 @@ class Store:
         valid_from: int,
         valid_end: int | None,
         recorded_at: int,
+        event_seq: int | None = None,
     ) -> None:
+        if event_seq is None:
+            event_seq = self.next_event_seq()
         self.connection.execute(
             """
             INSERT INTO versions(type, id, attribute, version, operation, value,
-                                 valid_from, valid_end, declared_end, recorded_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                 valid_from, valid_end, declared_end, recorded_at,
+                                 event_seq)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 entity_type,
@@ -331,8 +458,107 @@ class Store:
                 valid_end,
                 valid_end,
                 recorded_at,
+                event_seq,
             ),
         )
+
+    # -- audit --------------------------------------------------------------
+
+    def max_event_seq(self) -> int:
+        """Highest event sequence committed so far (0 in an empty ledger)."""
+        with self.lock:
+            row = self.connection.execute(
+                """
+                SELECT COALESCE(MAX(seq), 0) AS high FROM (
+                  SELECT MAX(event_seq) AS seq FROM versions
+                  UNION ALL
+                  SELECT MAX(event_seq) AS seq FROM truncations
+                )
+                """
+            ).fetchone()
+        return int(row["high"])
+
+    def audit_events(
+        self,
+        *,
+        high_seq: int,
+        limit: int,
+        after_recorded_at: int | None = None,
+        after_event_seq: int | None = None,
+        recorded_from: int | None = None,
+        recorded_to: int | None = None,
+        entity_type: str | None = None,
+        entity_id: str | None = None,
+        attribute: str | None = None,
+        action: str | None = None,
+    ) -> list[sqlite3.Row]:
+        """One page of audit items, ordered by ``(recorded_at, event_seq)``.
+
+        The audit trail is the union of committed version appends and window
+        truncations.  ``high_seq`` fixes the result set: no event whose
+        ``event_seq`` is greater (a concurrent write landing while a client is
+        paging) can enter the pages, so pagination never repeats or skips an
+        item.  Paging itself is keyset on ``(recorded_at, event_seq)``, the
+        columns the pages are ordered by.
+        """
+        wanted_actions = {
+            "version_appended": ["version_appended"],
+            "window_truncated": ["window_truncated"],
+            None: ["version_appended", "window_truncated"],
+        }[action]
+        branches = []
+        parameters: list[Any] = []
+        if "version_appended" in wanted_actions:
+            branches.append(
+                """
+                SELECT 'version_appended' AS action, event_seq, recorded_at, type, id,
+                       attribute, version, operation, value, valid_from, declared_end,
+                       NULL AS trunc_valid_end
+                  FROM versions
+                """
+            )
+        if "window_truncated" in wanted_actions:
+            branches.append(
+                """
+                SELECT 'window_truncated' AS action, event_seq, recorded_at, type, id,
+                       attribute, version, NULL AS operation, NULL AS value,
+                       NULL AS valid_from, NULL AS declared_end, valid_end AS trunc_valid_end
+                  FROM truncations
+                """
+            )
+        union = " UNION ALL ".join(branches)
+        clauses = ["event_seq <= ?"]
+        parameters.append(high_seq)
+        if recorded_from is not None:
+            clauses.append("recorded_at >= ?")
+            parameters.append(recorded_from)
+        if recorded_to is not None:
+            clauses.append("recorded_at < ?")
+            parameters.append(recorded_to)
+        if entity_type is not None:
+            clauses.append("type = ?")
+            parameters.append(entity_type)
+        if entity_id is not None:
+            clauses.append("id = ?")
+            parameters.append(entity_id)
+        if attribute is not None:
+            clauses.append("attribute = ?")
+            parameters.append(attribute)
+        if after_recorded_at is not None:
+            clauses.append(
+                "(recorded_at > ? OR (recorded_at = ? AND event_seq > ?))"
+            )
+            parameters.extend((after_recorded_at, after_recorded_at, after_event_seq))
+        where = " WHERE " + " AND ".join(clauses)
+        # Fetch one extra row so the caller knows whether another page exists
+        # without counting the whole (possibly large) trail.
+        sql = (
+            f"SELECT * FROM ({union}){where} "
+            "ORDER BY recorded_at, event_seq LIMIT ?"
+        )
+        parameters.append(limit + 1)
+        with self.lock:
+            return list(self.connection.execute(sql, parameters).fetchall())
 
     # -- idempotency --------------------------------------------------------
 
