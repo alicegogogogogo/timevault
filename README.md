@@ -487,6 +487,85 @@ error. The query is read-only: it appends no versions and moves no transaction
 time, and data written through `POST /batch` takes part in the same computation
 as data written one request at a time.
 
+### Trace ledger changes
+
+```http
+GET /audit
+GET /audit?type=account&id=acct-1&attribute=tier
+GET /audit?action=version_appended&recorded_from=2024-05-01T00:00:00Z&recorded_to=2024-06-01T00:00:00Z
+GET /audit?limit=50&cursor=…
+```
+
+Every committed write leaves two kinds of immutable entries on the audit
+ledger, one per **committed** event:
+
+- `version_appended` — one item per version a create or correction appended;
+- `window_truncated` — one item per window a correction closed (both the
+  straddling trim and each supersession), carrying the transaction instant the
+  bound was learned at.
+
+A request that fails or rolls back leaves nothing; an idempotent replay writes
+nothing and therefore adds no item. Every item of one `POST /batch` shares the
+batch's single `recorded_at`. The query itself is strictly read-only.
+
+Items are ordered by `recorded_at` ascending; within one millisecond the
+`event_id` — a stable, never-reused digest of the item's immutable committed
+coordinates — determines the order, and that order is identical after a
+restart. Filters:
+
+| parameter | effect |
+| --- | --- |
+| `type` | only items for entities of this type |
+| `id` | only items for this entity; requires `type` |
+| `attribute` | only items touching this attribute |
+| `action` | `version_appended` or `window_truncated` |
+| `recorded_from` | inclusive transaction-time lower bound |
+| `recorded_to` | exclusive transaction-time upper bound |
+| `limit` | page size, 1–500, default 100 |
+| `cursor` | continue a previously pinned result set |
+
+The time bounds accept the same forms as every other transaction-time input
+(RFC 3339 string, epoch milliseconds, or float seconds) and are interpreted as
+the half-open interval `[recorded_from, recorded_to)`; `recorded_from` must be
+strictly earlier than `recorded_to`. Unknown parameters, a limit outside
+1–500, an `id` without a `type`, an unknown or corrupted cursor, and any other
+malformed argument are `validation_error`. A legal range that matches nothing
+— an empty store included — is `200` with an empty `items` and a `null`
+cursor, not an error.
+
+```json
+{"items": [
+  {"event_id": "2e619c6b…", "recorded_at": "2024-05-01T00:00:00.000Z",
+   "type": "account", "id": "acct-1", "attribute": "tier", "version": 1,
+   "action": "version_appended", "operation": "assert", "value": "gold",
+   "valid_from": "2024-01-01T00:00:00.000Z", "declared_end": null},
+  {"event_id": "41e623c2…", "recorded_at": "2024-05-31T00:00:00.000Z",
+   "type": "account", "id": "acct-1", "attribute": "tier", "version": 1,
+   "action": "window_truncated", "valid_end": "2024-03-01T00:00:00.000Z"}],
+ "next_cursor": null}
+```
+
+Every item carries `event_id`, `recorded_at`, `type`, `id`, `attribute`,
+`version`, and `action`. A `version_appended` item additionally carries the
+exact `operation`, `value`, `valid_from`, and `declared_end` it committed with
+— including a retraction's null value and empty window — read off the audit
+row rather than the version's current state, so a later correction can never
+rewrite an older item. A `window_truncated` item carries only the `valid_end`
+learned by that truncation. Together, `type`/`id`/`attribute`/`version` locate
+the source row behind any ordinary read or `/history` result.
+
+The first query returns a cursor when more items match; the cursor pins the
+result set's upper bound and keeps the filters, so a write that commits
+concurrently afterwards never enters later pages, and walking the pages
+neither repeats nor skips an item. When `cursor` is present every other filter
+is forbidden, though `limit` may change between pages. The cursor is opaque
+and signed; one issued against another database is unknown and is rejected.
+
+Databases created before this entry point existed need no migration: on open,
+their committed `versions` and `truncations` rows are projected once into the
+audit ledger (the unique event ids make the projection idempotent), so
+pre-upgrade history is auditable exactly like new writes.
+
 ## Errors
 
 ```json

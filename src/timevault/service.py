@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
+import json
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -12,13 +15,148 @@ from .model import (
     Entity,
     Fact,
     INFINITY,
+    attribute_name,
     identifier,
     instant,
     iso,
     parse_batch,
     value_same,
 )
-from .store import Store
+from .store import ACTION_VERSION_APPENDED, ACTION_WINDOW_TRUNCATED, Store
+
+DEFAULT_AUDIT_LIMIT = 100
+MAX_AUDIT_LIMIT = 500
+_AUDIT_ACTIONS = (ACTION_VERSION_APPENDED, ACTION_WINDOW_TRUNCATED)
+# Pinned filter set carried inside a cursor; nothing else may appear there.
+_CURSOR_FILTER_KEYS = ("action", "type", "id", "attribute", "recorded_from", "recorded_to")
+
+
+def _b64url(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _b64url_decode(text: str) -> bytes:
+    try:
+        return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
+    except (binascii.Error, ValueError) as error:
+        raise ValidationError("cursor is unknown or malformed") from error
+
+
+# A cursor is self-describing, but it is also signed so a hand-edited or
+# truncated token fails the same way an unknown one does instead of silently
+# walking someone else's result set.
+_CURSOR_VERSION = 1
+_CURSOR_SALT = b"timevault-audit-cursor-v1"
+
+
+@dataclass(frozen=True)
+class AuditFilters:
+    """The validated filter set of one audit query."""
+
+    action: str | None = None
+    entity_type: str | None = None
+    entity_id: str | None = None
+    attribute: str | None = None
+    recorded_from: int | None = None
+    recorded_to: int | None = None
+
+    def as_cursor(self) -> dict[str, Any]:
+        saved: dict[str, Any] = {}
+        if self.action is not None:
+            saved["action"] = self.action
+        if self.entity_type is not None:
+            saved["type"] = self.entity_type
+        if self.entity_id is not None:
+            saved["id"] = self.entity_id
+        if self.attribute is not None:
+            saved["attribute"] = self.attribute
+        if self.recorded_from is not None:
+            saved["recorded_from"] = self.recorded_from
+        if self.recorded_to is not None:
+            saved["recorded_to"] = self.recorded_to
+        return saved
+
+    @classmethod
+    def from_cursor(cls, saved: Any) -> "AuditFilters":
+        if not isinstance(saved, dict):
+            raise ValidationError("cursor is unknown or malformed")
+        unknown = sorted(set(saved) - set(_CURSOR_FILTER_KEYS))
+        if unknown:
+            raise ValidationError("cursor is unknown or malformed")
+        strings = {"action": None, "type": None, "id": None, "attribute": None}
+        for key in strings:
+            if key in saved and not isinstance(saved[key], str):
+                raise ValidationError("cursor is unknown or malformed")
+        times: dict[str, int | None] = {}
+        for key in ("recorded_from", "recorded_to"):
+            if key in saved:
+                if not isinstance(saved[key], int) or isinstance(saved[key], bool):
+                    raise ValidationError("cursor is unknown or malformed")
+                times[key] = saved[key]
+        action = saved.get("action")
+        if action is not None and action not in _AUDIT_ACTIONS:
+            raise ValidationError("cursor is unknown or malformed")
+        return cls(
+            action=action,
+            entity_type=saved.get("type"),
+            entity_id=saved.get("id"),
+            attribute=saved.get("attribute"),
+            recorded_from=times.get("recorded_from"),
+            recorded_to=times.get("recorded_to"),
+        )
+
+
+def _encode_cursor(filters: AuditFilters, upper_seq: int, after: tuple[int, str] | None) -> str:
+    payload = json.dumps(
+        {
+            "v": _CURSOR_VERSION,
+            "f": filters.as_cursor(),
+            "u": upper_seq,
+            "a": None if after is None else [after[0], after[1]],
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    signature = hashlib.sha256(_CURSOR_SALT + b"." + payload).digest()
+    return _b64url(payload) + "." + _b64url(signature)
+
+
+def _decode_cursor(token: str) -> tuple[AuditFilters, int, tuple[int, str] | None]:
+    bad = ValidationError("cursor is unknown or malformed")
+    if not isinstance(token, str) or "." not in token:
+        raise bad
+    payload_text, signature_text = token.rsplit(".", 1)
+    try:
+        payload = _b64url_decode(payload_text)
+        signature = _b64url_decode(signature_text)
+    except ValidationError:
+        raise bad from None
+    if hashlib.sha256(_CURSOR_SALT + b"." + payload).digest() != signature:
+        raise bad
+    try:
+        state = json.loads(payload)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise bad from None
+    if not isinstance(state, dict) or state.get("v") != _CURSOR_VERSION:
+        raise bad
+    upper_seq = state.get("u")
+    if not isinstance(upper_seq, int) or isinstance(upper_seq, bool) or upper_seq < 0:
+        raise bad
+    after_raw = state.get("a")
+    after: tuple[int, str] | None
+    if after_raw is None:
+        after = None
+    elif (
+        isinstance(after_raw, list)
+        and len(after_raw) == 2
+        and isinstance(after_raw[0], int)
+        and not isinstance(after_raw[0], bool)
+        and isinstance(after_raw[1], str)
+    ):
+        after = (after_raw[0], after_raw[1])
+    else:
+        raise bad
+    return AuditFilters.from_cursor(state.get("f")), upper_seq, after
 
 
 @dataclass(frozen=True)
@@ -589,6 +727,177 @@ class TimeVault:
             "removed": removed,
             "changed": changed,
         }
+
+    def audit(
+        self,
+        *,
+        entity_type: Any = None,
+        entity_id: Any = None,
+        attribute: Any = None,
+        action: Any = None,
+        recorded_from: Any = None,
+        recorded_to: Any = None,
+        limit: Any = None,
+        cursor: Any = None,
+    ) -> dict[str, Any]:
+        """Trace committed ledger changes back to their sources.
+
+        Every committed version append and every window truncation is one
+        immutable audit item.  The query is read-only: it appends nothing and
+        moves no transaction time.  Items are ordered by ``recorded_at``
+        ascending, and the event id breaks ties inside one millisecond with a
+        value that is stable and never reused, so the order is identical after
+        a restart.
+
+        The first response pins the result set: its cursor carries the
+        filters and the sequence upper bound assigned at that moment, so
+        later concurrent writes never enter later pages and pagination
+        neither repeats nor skips an item.  A request carrying a cursor may
+        not repeat any filter apart from ``limit``.
+        """
+        if cursor is not None:
+            if not isinstance(cursor, str) or not cursor:
+                raise ValidationError("cursor is unknown or malformed")
+            pinned_filters, upper_seq, after = _decode_cursor(cursor)
+            # With a cursor every filter but limit is fixed by the first page.
+            repeated = {
+                "type": entity_type,
+                "id": entity_id,
+                "attribute": attribute,
+                "action": action,
+                "recorded_from": recorded_from,
+                "recorded_to": recorded_to,
+            }
+            given = sorted(name for name, value in repeated.items() if value is not None)
+            if given:
+                raise ValidationError(
+                    f"filter parameter(s) {', '.join(given)} cannot be combined with cursor"
+                )
+            filters = pinned_filters
+        else:
+            filters = self._parse_audit_filters(
+                entity_type, entity_id, attribute, action, recorded_from, recorded_to
+            )
+            after = None
+            # Pin the result set to what has committed so far.  A commit that
+            # lands after this reading but before the page is read gets a
+            # higher sequence and is excluded by the page's ``seq <= upper``
+            # bound, so the two reads need not share one lock acquisition.
+            upper_seq = self.store.max_audit_seq()
+
+        page_limit = self._parse_audit_limit(limit)
+        if after is not None and not self.store.audit_key_exists(after[0], after[1], upper_seq):
+            # The token's position does not exist in this ledger (it was
+            # minted against another database), so treat it as unknown.
+            raise ValidationError("cursor is unknown or malformed")
+        rows = self.store.audit_page(
+            after_recorded_at=None if after is None else after[0],
+            after_event_id=None if after is None else after[1],
+            upper_seq=upper_seq,
+            limit=page_limit,
+            action=filters.action,
+            entity_type=filters.entity_type,
+            entity_id=filters.entity_id,
+            attribute=filters.attribute,
+            recorded_from=filters.recorded_from,
+            recorded_to=filters.recorded_to,
+        )
+        has_more = len(rows) > page_limit
+        page = rows[:page_limit]
+        items = [self._audit_item(row) for row in page]
+        next_cursor: str | None = None
+        if has_more and page:
+            last = page[-1]
+            next_cursor = _encode_cursor(
+                filters, upper_seq, (int(last["recorded_at"]), str(last["event_id"]))
+            )
+        return {"items": items, "next_cursor": next_cursor}
+
+    @staticmethod
+    def _parse_audit_limit(raw: Any) -> int:
+        if raw is None:
+            return DEFAULT_AUDIT_LIMIT
+        if isinstance(raw, bool) or isinstance(raw, float):
+            raise ValidationError("limit must be an integer between 1 and 500")
+        if isinstance(raw, int):
+            value = raw
+        else:
+            try:
+                text = str(raw).strip()
+                value = int(text)
+            except (TypeError, ValueError):
+                raise ValidationError("limit must be an integer between 1 and 500") from None
+            else:
+                if str(value) != text:
+                    raise ValidationError("limit must be an integer between 1 and 500")
+        if value < 1 or value > MAX_AUDIT_LIMIT:
+            raise ValidationError("limit must be between 1 and 500")
+        return value
+
+    def _parse_audit_filters(
+        self,
+        entity_type: Any,
+        entity_id: Any,
+        attribute: Any,
+        action: Any,
+        recorded_from: Any,
+        recorded_to: Any,
+    ) -> AuditFilters:
+        if entity_id is not None and entity_type is None:
+            raise ValidationError("scoping by id requires a type as well")
+        if entity_type is not None:
+            entity_type = identifier(entity_type, "entity type")
+        if entity_id is not None:
+            entity_id = identifier(entity_id, "entity id")
+        if attribute is not None:
+            attribute = attribute_name(attribute)
+        if action is not None:
+            if action not in _AUDIT_ACTIONS:
+                raise ValidationError(
+                    "action must be version_appended or window_truncated"
+                )
+        start = None if recorded_from is None else instant(recorded_from, "recorded_from")
+        end = None if recorded_to is None else instant(recorded_to, "recorded_to")
+        if start is not None and end is not None and start >= end:
+            raise ValidationError("recorded_from must be strictly earlier than recorded_to")
+        return AuditFilters(
+            action=action,
+            entity_type=entity_type,
+            entity_id=entity_id,
+            attribute=attribute,
+            recorded_from=start,
+            recorded_to=end,
+        )
+
+    @staticmethod
+    def _audit_item(row: Any) -> dict[str, Any]:
+        """Render one committed ledger event as its public audit document.
+
+        The fields describing the value at commit time are read off the audit
+        row itself, never off the version's current state, so a correction that
+        later trims the window cannot rewrite an earlier audit item: the
+        append reports the declared end it committed with, and the truncation
+        reports the bound learned at its own transaction instant.
+        """
+        recorded_at = int(row["recorded_at"])
+        item: dict[str, Any] = {
+            "event_id": str(row["event_id"]),
+            "recorded_at": iso(recorded_at),
+            "type": str(row["type"]),
+            "id": str(row["id"]),
+            "attribute": str(row["attribute"]),
+            "version": int(row["version"]),
+            "action": str(row["action"]),
+        }
+        if str(row["action"]) == ACTION_VERSION_APPENDED:
+            item["operation"] = str(row["operation"])
+            item["value"] = None if row["value"] is None else Store.decode(row["value"])
+            item["valid_from"] = iso(int(row["valid_from"]))
+            declared = row["declared_end"]
+            item["declared_end"] = None if declared is None else iso(int(declared))
+        else:
+            item["valid_end"] = iso(int(row["valid_end"]))
+        return item
 
     # -- internals ----------------------------------------------------------
 

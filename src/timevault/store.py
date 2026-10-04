@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import threading
@@ -12,6 +13,9 @@ from .model import epoch_millis
 
 # One truncation event, as handed to :meth:`Store.insert_truncation`.
 TruncationRecord = tuple[str, str, str, int, int, int]
+
+ACTION_VERSION_APPENDED = "version_appended"
+ACTION_WINDOW_TRUNCATED = "window_truncated"
 
 
 class Store:
@@ -76,8 +80,148 @@ class Store:
               operation TEXT NOT NULL,
               response TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS audit_events (
+              seq INTEGER PRIMARY KEY AUTOINCREMENT,
+              event_id TEXT NOT NULL UNIQUE,
+              recorded_at INTEGER NOT NULL,
+              action TEXT NOT NULL,
+              type TEXT NOT NULL,
+              id TEXT NOT NULL,
+              attribute TEXT NOT NULL,
+              version INTEGER NOT NULL,
+              operation TEXT,
+              value TEXT,
+              valid_from INTEGER,
+              declared_end INTEGER,
+              valid_end INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS audit_events_scan
+              ON audit_events(recorded_at, event_id);
             """
         )
+        self._backfill_audit()
+
+    @staticmethod
+    def audit_event_id(*parts: Any) -> str:
+        """Deterministic, collision-resistant identity for one audit item.
+
+        The digest is taken over the immutable ledger coordinates of the event
+        — its action, entity coordinates, version, transaction instant, and the
+        payload the write committed — so the same committed row always derives
+        the same id, while two distinct events cannot share one.  A version
+        later corrected carries different coordinates and therefore a different
+        id, so an old audit item can never be retroactively rewritten.
+        """
+        joined = "\x1f".join("" if part is None else str(part) for part in parts)
+        return hashlib.sha256(joined.encode("utf-8")).hexdigest()
+
+    def _backfill_audit(self) -> None:
+        """Project rows written by older releases into the audit ledger.
+
+        Databases created before the audit entry point existed hold committed
+        ``versions`` and ``truncations`` rows but no audit items.  Every such
+        row is described once here, in the same deterministic order fresh
+        writes use: transaction time first, then stable entity and version
+        coordinates.
+
+        Each projection runs in one transaction, so a crash can never leave it
+        half applied; the UNIQUE index on ``event_id`` makes a re-run idempotent
+        as well, so reopening a database can never double-fill it.
+        """
+        with self.lock:
+            already = self.connection.execute(
+                "SELECT 1 FROM audit_events WHERE action = ? LIMIT 1",
+                (ACTION_VERSION_APPENDED,),
+            ).fetchone()
+            if already is None:
+                version_rows = self.connection.execute(
+                    """
+                    SELECT type, id, attribute, version, operation, value,
+                           valid_from, declared_end, recorded_at
+                      FROM versions
+                     ORDER BY recorded_at, type, id, attribute, version
+                    """
+                ).fetchall()
+                legacy: list[tuple[Any, ...]] = []
+                for row in version_rows:
+                    event_id = self.audit_event_id(
+                        ACTION_VERSION_APPENDED,
+                        row["type"], row["id"], row["attribute"], row["version"],
+                        row["recorded_at"], row["operation"], row["value"],
+                        row["valid_from"], row["declared_end"],
+                    )
+                    legacy.append(
+                        (
+                            event_id,
+                            int(row["recorded_at"]),
+                            ACTION_VERSION_APPENDED,
+                            row["type"], row["id"], row["attribute"], int(row["version"]),
+                            row["operation"], row["value"],
+                            int(row["valid_from"]), row["declared_end"], None,
+                        )
+                    )
+                if legacy:
+                    self.connection.execute("BEGIN")
+                    try:
+                        self.connection.executemany(
+                            """
+                            INSERT OR IGNORE INTO audit_events(
+                                event_id, recorded_at, action, type, id, attribute, version,
+                                operation, value, valid_from, declared_end, valid_end)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            legacy,
+                        )
+                    except Exception:
+                        self.connection.execute("ROLLBACK")
+                        raise
+                    else:
+                        self.connection.execute("COMMIT")
+            already = self.connection.execute(
+                "SELECT 1 FROM audit_events WHERE action = ? LIMIT 1",
+                (ACTION_WINDOW_TRUNCATED,),
+            ).fetchone()
+            if already is None:
+                truncation_rows = self.connection.execute(
+                    """
+                    SELECT rowid, type, id, attribute, version, recorded_at, valid_end
+                      FROM truncations
+                     ORDER BY recorded_at, type, id, attribute, version, valid_end, rowid
+                    """
+                ).fetchall()
+                legacy = []
+                for row in truncation_rows:
+                    event_id = self.audit_event_id(
+                        ACTION_WINDOW_TRUNCATED,
+                        row["type"], row["id"], row["attribute"], row["version"],
+                        row["recorded_at"], row["valid_end"], row["rowid"],
+                    )
+                    legacy.append(
+                        (
+                            event_id,
+                            int(row["recorded_at"]),
+                            ACTION_WINDOW_TRUNCATED,
+                            row["type"], row["id"], row["attribute"], int(row["version"]),
+                            None, None, None, None, int(row["valid_end"]),
+                        )
+                    )
+                if legacy:
+                    self.connection.execute("BEGIN")
+                    try:
+                        self.connection.executemany(
+                            """
+                            INSERT OR IGNORE INTO audit_events(
+                                event_id, recorded_at, action, type, id, attribute, version,
+                                operation, value, valid_from, declared_end, valid_end)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            legacy,
+                        )
+                    except Exception:
+                        self.connection.execute("ROLLBACK")
+                        raise
+                    else:
+                        self.connection.execute("COMMIT")
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
@@ -293,12 +437,39 @@ class Store:
                 (entity_type, entity_id, attribute, version, recorded_at, at)
             )
         if events:
+            # Insert one row at a time so the stable rowid of each truncation is
+            # known: a version can be superseded more than once inside one
+            # batch, which yields truncation rows identical on every column, and
+            # only their persistent rowids tell those distinct events apart.
+            audit_rows: list[tuple[Any, ...]] = []
+            for event in events:
+                cursor = self.connection.execute(
+                    """
+                    INSERT INTO truncations(type, id, attribute, version, recorded_at, valid_end)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    event,
+                )
+                audit_rows.append(
+                    (
+                        self.audit_event_id(
+                            ACTION_WINDOW_TRUNCATED,
+                            event[0], event[1], event[2], event[3], event[4], event[5],
+                            cursor.lastrowid,
+                        ),
+                        event[4],
+                        ACTION_WINDOW_TRUNCATED,
+                        event[0], event[1], event[2], event[3], event[5],
+                    )
+                )
             self.connection.executemany(
                 """
-                INSERT INTO truncations(type, id, attribute, version, recorded_at, valid_end)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO audit_events(
+                    event_id, recorded_at, action, type, id, attribute, version,
+                    operation, value, valid_from, declared_end, valid_end)
+                VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?)
                 """,
-                events,
+                audit_rows,
             )
         return events
 
@@ -314,6 +485,7 @@ class Store:
         valid_end: int | None,
         recorded_at: int,
     ) -> None:
+        encoded = None if value is None else self.encode(value)
         self.connection.execute(
             """
             INSERT INTO versions(type, id, attribute, version, operation, value,
@@ -326,11 +498,37 @@ class Store:
                 attribute,
                 version,
                 operation,
-                None if value is None else self.encode(value),
+                encoded,
                 valid_from,
                 valid_end,
                 valid_end,
                 recorded_at,
+            ),
+        )
+        event_id = self.audit_event_id(
+            ACTION_VERSION_APPENDED,
+            entity_type, entity_id, attribute, version, recorded_at,
+            operation, encoded, valid_from, valid_end,
+        )
+        self.connection.execute(
+            """
+            INSERT INTO audit_events(
+                event_id, recorded_at, action, type, id, attribute, version,
+                operation, value, valid_from, declared_end, valid_end)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+            """,
+            (
+                event_id,
+                recorded_at,
+                ACTION_VERSION_APPENDED,
+                entity_type,
+                entity_id,
+                attribute,
+                version,
+                operation,
+                encoded,
+                valid_from,
+                valid_end,
             ),
         )
 
@@ -355,3 +553,99 @@ class Store:
             "INSERT INTO idempotency(key, operation, response) VALUES (?, ?, ?)",
             (key, operation, self.encode(response)),
         )
+
+    # -- audit --------------------------------------------------------------
+
+    def max_audit_seq(self) -> int:
+        """The sequence assigned so far; the upper bound a first page pins."""
+        with self.lock:
+            row = self.connection.execute("SELECT COALESCE(MAX(seq), 0) AS m FROM audit_events").fetchone()
+        return int(row["m"])
+
+    def audit_key_exists(self, recorded_at: int, event_id: str, upper_seq: int) -> bool:
+        """Whether a cursor's last-returned item is a real row in this store.
+
+        The ledger is append-only, so a cursor this store issued always finds
+        its position here.  A token minted against another database (or one
+        pointing past the pinned result set) does not, which is how such a
+        cursor is reported as unknown instead of silently walking foreign
+        data.
+        """
+        with self.lock:
+            row = self.connection.execute(
+                "SELECT 1 FROM audit_events WHERE recorded_at = ? AND event_id = ? AND seq <= ?",
+                (recorded_at, event_id, upper_seq),
+            ).fetchone()
+        return row is not None
+
+    def audit_page(
+        self,
+        *,
+        after_recorded_at: int | None,
+        after_event_id: str | None,
+        upper_seq: int,
+        limit: int,
+        action: str | None = None,
+        entity_type: str | None = None,
+        entity_id: str | None = None,
+        attribute: str | None = None,
+        recorded_from: int | None = None,
+        recorded_to: int | None = None,
+    ) -> list[sqlite3.Row]:
+        """One stable page of audit items.
+
+        Ordering is ``(recorded_at, event_id)`` ascending: ``recorded_at``
+        puts the items on the transaction axis, and the event id breaks ties
+        inside one millisecond.  Event ids derive from the immutable
+        coordinates of the committed event, so that tie-break is stable, never
+        reused, and identical after a restart — the order lives in the rows,
+        not in a clock reading.
+
+        Pagination is keyset-based: the cursor carries the last seen
+        ``(recorded_at, event_id)`` pair, which is what makes pages overlap-
+        and gap-free even when several events share a millisecond.
+        ``upper_seq`` independently pins the result set: items committed
+        after the first page was opened (their ``seq`` is higher) never
+        enter later pages, so a concurrent writer cannot move the window
+        the cursor walks.
+        """
+        clauses = ["seq <= ?"]
+        parameters: list[Any] = [upper_seq]
+        if after_recorded_at is None:
+            # Nothing has been consumed yet: the lower recorded-time bound, if
+            # any, is the only starting line.
+            if recorded_from is not None:
+                clauses.append("recorded_at >= ?")
+                parameters.append(recorded_from)
+        else:
+            # Strictly after the last returned key, on the same ordered pair.
+            clauses.append("(recorded_at > ? OR (recorded_at = ? AND event_id > ?))")
+            parameters.extend([after_recorded_at, after_recorded_at, after_event_id])
+            if recorded_from is not None:
+                clauses.append("recorded_at >= ?")
+                parameters.append(recorded_from)
+        if action is not None:
+            clauses.append("action = ?")
+            parameters.append(action)
+        if entity_type is not None:
+            clauses.append("type = ?")
+            parameters.append(entity_type)
+        if entity_id is not None:
+            clauses.append("id = ?")
+            parameters.append(entity_id)
+        if attribute is not None:
+            clauses.append("attribute = ?")
+            parameters.append(attribute)
+        if recorded_to is not None:
+            clauses.append("recorded_at < ?")
+            parameters.append(recorded_to)
+        sql = (
+            "SELECT seq, event_id, recorded_at, action, type, id, attribute, version, "
+            "operation, value, valid_from, declared_end, valid_end FROM audit_events"
+            " WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY recorded_at, event_id LIMIT ?"
+        )
+        parameters.append(limit + 1)
+        with self.lock:
+            return list(self.connection.execute(sql, parameters).fetchall())
