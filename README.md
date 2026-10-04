@@ -424,6 +424,40 @@ different version supplies it. `attribute` may be repeated to narrow the result;
 naming an attribute the entity never had is a `validation_error`. `to` must be
 strictly later than `from`, and the entity must be in effect at both instants.
 
+### Diff two aspects (service layer)
+
+`TimeVault.snapshot_diff(first, second, entity_type=None, entity_id=None)`
+compares the visible records of two **aspects**, where each aspect is a mapping
+with an optional `as_of` and `known_at` (either defaults to the current
+instant, exactly as a plain read does). Each aspect is evaluated under the
+ordinary visibility rules of its own `known_at`, so a correction recorded
+after an aspect's `known_at` cannot leak into it, and a version retracted
+there is not visible. The scope follows the other queries: `entity_type` with
+`entity_id` diffs one entity, `entity_type` alone diffs that collection, and
+neither diffs the whole store.
+
+Entities are matched across the aspects by their stable `(type, id)` identity
+and classified as `added` (visible only in the second aspect), `removed`
+(visible only in the first), or `changed` (visible in both with different
+public data content — the attribute values a read reports; version numbers and
+transaction metadata never count). Added and removed entries carry the full
+visible record at their aspect; changed entries carry both records under
+`before` and `after`. Every category is ordered by `(type, id)`, so the same
+data and parameters always yield the same result, and an empty store, an empty
+scope, or two identical aspects simply yield three empty categories. Invalid
+instants raise the same `validation_error` a read raises, and the query is
+read-only.
+
+```json
+{"first": {"as_of": "2024-02-01T00:00:00.000Z", "known_at": "2024-05-15T00:00:00.000Z"},
+ "second": {"as_of": "2024-04-01T00:00:00.000Z", "known_at": "2024-05-31T00:00:00.000Z"},
+ "added": [{"type": "account", "id": "acct-3", "as_of": "...", "known_at": "...",
+            "attributes": {"tier": {"value": "bronze", "version": 1, "..." : "..."}}}],
+ "removed": [],
+ "changed": [{"before": {"type": "account", "id": "acct-1", "...": "..."},
+              "after": {"type": "account", "id": "acct-1", "...": "..."}}]}
+```
+
 ## Errors
 
 ```json

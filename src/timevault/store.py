@@ -115,6 +115,25 @@ class Store:
                 (entity_type, entity_id),
             ).fetchone()
 
+    def entity_keys(self, entity_type: str | None = None) -> list[tuple[str, str]]:
+        """Every known ``(type, id)`` pair, in stable sorted order.
+
+        With ``entity_type`` given, only that collection is listed.  The order
+        is the ordering a snapshot diff reports its categories in, so the same
+        data always yields byte-identical results.
+        """
+        with self.lock:
+            if entity_type is None:
+                rows = self.connection.execute(
+                    "SELECT type, id FROM entities ORDER BY type, id"
+                ).fetchall()
+            else:
+                rows = self.connection.execute(
+                    "SELECT type, id FROM entities WHERE type = ? ORDER BY type, id",
+                    (entity_type,),
+                ).fetchall()
+        return [(str(row["type"]), str(row["id"])) for row in rows]
+
     def insert_entity(self, entity_type: str, entity_id: str, created_at: int) -> None:
         self.connection.execute(
             "INSERT INTO entities(type, id, created_at) VALUES (?, ?, ?)",

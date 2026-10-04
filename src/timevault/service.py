@@ -12,6 +12,7 @@ from .model import (
     Entity,
     Fact,
     INFINITY,
+    identifier,
     instant,
     iso,
     parse_batch,
@@ -267,6 +268,18 @@ def _value_document(entry: tuple[Any, int, str, int, int | None, int] | None) ->
     }
 
 
+def _same_content(left: Projection, right: Projection) -> bool:
+    """Whether two projections carry the same public data content.
+
+    Only the attribute values a read reports count: version numbers, window
+    bounds, and transaction stamps are storage metadata, so a correction that
+    rewrites a value with itself is not a difference.
+    """
+    if set(left) != set(right):
+        return False
+    return all(value_same(left[name][0], right[name][0]) for name in left)
+
+
 def _batch_operation_name(raw: Any) -> str:
     """The idempotency-operation label for a batch request.
 
@@ -492,7 +505,119 @@ class TimeVault:
             "changes": changes,
         }
 
+    def snapshot_diff(
+        self,
+        first: Any = None,
+        second: Any = None,
+        entity_type: str | None = None,
+        entity_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Compare the visible records of two bitemporal aspects.
+
+        Each aspect is a mapping with an optional ``as_of`` (valid time) and
+        ``known_at`` (transaction time); either coordinate defaults to the
+        current instant, exactly as a plain read does, and each aspect is
+        evaluated under the ordinary visibility rules of its own ``known_at``
+        — a correction recorded after an aspect's ``known_at`` cannot leak into
+        it, and a version retracted there is not a visible record.
+
+        The scope follows the existing queries: ``entity_type`` together with
+        ``entity_id`` diffs one entity, ``entity_type`` alone diffs that whole
+        collection, and neither diffs every entity in the store.  Entities are
+        matched across the two aspects by their stable ``(type, id)`` identity
+        and classified as ``added`` (visible only in the second aspect),
+        ``removed`` (visible only in the first), or ``changed`` (visible in
+        both, with different public data content).  Content means the
+        attribute values a read reports: a difference only in version numbers
+        or transaction metadata is not a change.  Every category is ordered by
+        ``(type, id)``, so the same data and parameters always yield the same
+        result, and an empty store, an empty scope, or two identical aspects
+        simply yield three empty categories.  The query is read-only.
+        """
+        moment = self.store.now()
+        first_as_of, first_known_at = self._aspect(first, moment)
+        second_as_of, second_known_at = self._aspect(second, moment)
+        keys = self._scope_keys(entity_type, entity_id)
+
+        added: list[dict[str, Any]] = []
+        removed: list[dict[str, Any]] = []
+        changed: list[dict[str, Any]] = []
+        for key_type, key_id in keys:
+            before = self._visible_projection(key_type, key_id, first_as_of, first_known_at)
+            after = self._visible_projection(key_type, key_id, second_as_of, second_known_at)
+            if before is None and after is None:
+                continue
+            if before is None:
+                added.append(self._read(key_type, key_id, second_as_of, second_known_at))
+            elif after is None:
+                removed.append(self._read(key_type, key_id, first_as_of, first_known_at))
+            elif not _same_content(before, after):
+                changed.append(
+                    {
+                        "before": self._read(key_type, key_id, first_as_of, first_known_at),
+                        "after": self._read(key_type, key_id, second_as_of, second_known_at),
+                    }
+                )
+        return {
+            "first": {"as_of": iso(first_as_of), "known_at": iso(first_known_at)},
+            "second": {"as_of": iso(second_as_of), "known_at": iso(second_known_at)},
+            "added": added,
+            "removed": removed,
+            "changed": changed,
+        }
+
     # -- internals ----------------------------------------------------------
+
+    def _aspect(self, raw: Any, moment: int) -> tuple[int, int]:
+        """Parse one diff aspect into its ``(as_of, known_at)`` coordinates.
+
+        Both coordinates accept whatever :func:`instant` accepts and default to
+        the current instant, so an omitted aspect means "as believed now" —
+        the same defaults a plain read uses, and the same validation errors.
+        """
+        if raw is None:
+            return moment, moment
+        if not isinstance(raw, dict):
+            raise ValidationError("each aspect must be an object with as_of and known_at")
+        unknown = sorted(set(raw) - {"as_of", "known_at"})
+        if unknown:
+            raise ValidationError(f"unknown field(s): {', '.join(unknown)}")
+        as_of = moment if raw.get("as_of") is None else instant(raw["as_of"], "as_of")
+        known_at = moment if raw.get("known_at") is None else instant(raw["known_at"], "known_at")
+        return as_of, known_at
+
+    def _scope_keys(
+        self, entity_type: str | None, entity_id: str | None
+    ) -> list[tuple[str, str]]:
+        """Resolve the diff scope to the ordered list of entities it covers."""
+        if entity_id is not None and entity_type is None:
+            raise ValidationError("an entity id scope requires an entity type")
+        if entity_id is not None:
+            return [
+                (
+                    identifier(entity_type, "entity type"),
+                    identifier(entity_id, "entity id"),
+                )
+            ]
+        if entity_type is not None:
+            identifier(entity_type, "entity type")
+        return self.store.entity_keys(entity_type)
+
+    def _visible_projection(
+        self, entity_type: str, entity_id: str, as_of: int, known_at: int
+    ) -> Projection | None:
+        """The projection one aspect shows, or ``None`` when nothing is visible.
+
+        An entity is invisible at an aspect when it does not exist, was not
+        recorded yet at the aspect's ``known_at``, or has no attribute in
+        effect at its ``as_of`` — the same conditions under which a single
+        entity read reports ``not_found``.
+        """
+        row = self.store.entity_row(entity_type, entity_id)
+        if row is None or int(row["created_at"]) > known_at:
+            return None
+        projection = self._projection(entity_type, entity_id, as_of, known_at, required=False)
+        return projection or None
 
     def _create_core(
         self,
