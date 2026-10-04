@@ -121,6 +121,32 @@ class Store:
             (entity_type, entity_id, created_at),
         )
 
+    def entity_keys(
+        self, entity_type: str | None = None, entity_id: str | None = None
+    ) -> list[tuple[str, str, int]]:
+        """Every entity in scope, with its record instant, in stable order.
+
+        A ``type`` alone selects every entity of that type, a ``type``/``id``
+        pair one entity, and no argument the whole store.  Rows come back
+        ordered by the stable identifier ``(type, id)``, so a caller walking
+        the result always visits entities in the same sequence.
+        """
+        clauses = []
+        parameters = []
+        if entity_type is not None:
+            clauses.append("type = ?")
+            parameters.append(entity_type)
+        if entity_id is not None:
+            clauses.append("id = ?")
+            parameters.append(entity_id)
+        where = "" if not clauses else " WHERE " + " AND ".join(clauses)
+        with self.lock:
+            rows = self.connection.execute(
+                f"SELECT type, id, created_at FROM entities{where} ORDER BY type, id",
+                parameters,
+            ).fetchall()
+        return [(str(row["type"]), str(row["id"]), int(row["created_at"])) for row in rows]
+
     # -- versions -----------------------------------------------------------
 
     def versions_for_entity(self, entity_type: str, entity_id: str) -> list[sqlite3.Row]:

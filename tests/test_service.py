@@ -1076,6 +1076,244 @@ class BatchTests(unittest.TestCase):
                 self.assertLessEqual(earlier_end, later_start)
 
 
+class SnapshotDiffTests(unittest.TestCase):
+    """Diffing the visible records of a scope between two bitemporal facets."""
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.clock = Clock()
+        self.vault = TimeVault(str(Path(self.directory.name) / "vault.db"), self.clock)
+        self.keys = 0
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def create(self, entity_id="acct-1", entity_type="account", key=None, **attributes):
+        self.keys += 1
+        payload = {
+            "id": entity_id,
+            "attributes": attributes or {"status": "active", "tier": "gold"},
+            "valid_from": "2024-01-01T00:00:00Z",
+        }
+        return self.vault.create_entity(entity_type, payload, key or f"create-{self.keys}")
+
+    def correct(self, facts, entity_id="acct-1", entity_type="account", as_of=None):
+        self.keys += 1
+        body = {"facts": facts}
+        if as_of is not None:
+            body["as_of"] = as_of
+        return self.vault.apply_correction(entity_type, entity_id, body, f"fix-{self.keys}")
+
+    def test_added_removed_and_changed_across_two_facets(self):
+        self.create("acct-1")
+        self.clock.advance(days=30)
+        self.correct(
+            [
+                {"attribute": "tier", "value": "platinum"},
+                {"attribute": "region", "value": "emea"},
+                {"attribute": "status", "deleted": True},
+            ],
+            as_of="2024-03-01T00:00:00Z",
+        )
+        self.clock.advance(days=30)
+        self.create("acct-2", tier="silver")
+
+        document = self.vault.snapshot_diff(
+            "account",
+            first_as_of="2024-04-01T00:00:00Z",
+            first_known_at="2024-05-15T00:00:00Z",
+            second_as_of="2024-04-01T00:00:00Z",
+        )
+        self.assertEqual([], document["removed"])
+        self.assertEqual(["acct-2"], [item["id"] for item in document["added"]])
+        self.assertEqual(["acct-1"], [item["id"] for item in document["changed"]])
+
+        # The first facet predates the correction, so its record shows the old
+        # belief with the window still open ended: nothing the later write
+        # learned leaks backwards into it.
+        before = document["changed"][0]["before"]
+        self.assertEqual("2024-05-15T00:00:00.000Z", before["known_at"])
+        self.assertEqual("gold", before["attributes"]["tier"]["value"])
+        self.assertIsNone(before["attributes"]["tier"]["valid_end"])
+        self.assertEqual("active", before["attributes"]["status"]["value"])
+        self.assertNotIn("region", before["attributes"])
+
+        after = document["changed"][0]["after"]
+        self.assertEqual("platinum", after["attributes"]["tier"]["value"])
+        self.assertEqual("emea", after["attributes"]["region"]["value"])
+        self.assertNotIn("status", after["attributes"])
+
+        added = document["added"][0]["record"]
+        self.assertEqual("acct-2", added["id"])
+        self.assertEqual("silver", added["attributes"]["tier"]["value"])
+
+    def test_an_entity_with_nothing_in_effect_is_removed(self):
+        self.create("acct-1")
+        self.clock.advance(days=30)
+        self.correct(
+            [{"attribute": "tier", "deleted": True}, {"attribute": "status", "deleted": True}],
+            as_of="2024-03-01T00:00:00Z",
+        )
+        document = self.vault.snapshot_diff(
+            "account",
+            "acct-1",
+            first_as_of="2024-02-01T00:00:00Z",
+            second_as_of="2024-04-01T00:00:00Z",
+        )
+        self.assertEqual([], document["added"])
+        self.assertEqual([], document["changed"])
+        self.assertEqual(["acct-1"], [item["id"] for item in document["removed"]])
+        record = document["removed"][0]["record"]
+        self.assertEqual("2024-02-01T00:00:00.000Z", record["as_of"])
+        self.assertEqual("gold", record["attributes"]["tier"]["value"])
+
+    def test_internal_version_and_record_time_alone_are_not_a_change(self):
+        """A rewrite of the same value over the same window is not a difference."""
+        self.create("acct-1", tier="gold")
+        self.clock.advance(days=30)
+        # Re-assert the same value over the same window: this appends version 2
+        # at a new transaction instant but changes no public data content.
+        self.correct([{"attribute": "tier", "value": "gold", "valid_from": "2024-01-01T00:00:00Z"}])
+        versions = [
+            item
+            for item in self.vault.history("account", "acct-1")["attributes"]
+            if item["attribute"] == "tier"
+        ][0]["versions"]
+        self.assertEqual(2, len(versions))
+
+        document = self.vault.snapshot_diff(
+            "account",
+            "acct-1",
+            first_as_of="2024-06-01T00:00:00Z",
+            first_known_at="2024-05-15T00:00:00Z",
+            second_as_of="2024-06-01T00:00:00Z",
+        )
+        self.assertEqual([], document["added"])
+        self.assertEqual([], document["removed"])
+        self.assertEqual([], document["changed"])
+
+    def test_a_trimmed_window_bound_is_public_content(self):
+        """Same value, but a different known valid_end: that is a change."""
+        self.create("acct-1", tier="gold")
+        self.clock.advance(days=30)
+        self.correct(
+            [
+                {
+                    "attribute": "tier",
+                    "value": "gold",
+                    "valid_from": "2024-01-01T00:00:00Z",
+                    "valid_end": "2024-03-01T00:00:00Z",
+                }
+            ]
+        )
+        document = self.vault.snapshot_diff(
+            "account",
+            "acct-1",
+            first_as_of="2024-02-01T00:00:00Z",
+            first_known_at="2024-05-15T00:00:00Z",
+            second_as_of="2024-02-01T00:00:00Z",
+        )
+        self.assertEqual(["acct-1"], [item["id"] for item in document["changed"]])
+        entry = document["changed"][0]
+        self.assertEqual("gold", entry["before"]["attributes"]["tier"]["value"])
+        self.assertIsNone(entry["before"]["attributes"]["tier"]["valid_end"])
+        self.assertEqual("gold", entry["after"]["attributes"]["tier"]["value"])
+        self.assertEqual(
+            "2024-03-01T00:00:00.000Z", entry["after"]["attributes"]["tier"]["valid_end"]
+        )
+
+    def test_empty_store_empty_scope_and_identical_facets_are_empty(self):
+        for kwargs in (
+            {},
+            {"entity_type": "account"},
+            {"entity_type": "account", "entity_id": "ghost"},
+        ):
+            with self.subTest(kwargs=kwargs):
+                document = self.vault.snapshot_diff(**kwargs)
+                self.assertEqual([], document["added"])
+                self.assertEqual([], document["removed"])
+                self.assertEqual([], document["changed"])
+
+        self.create("acct-1")
+        document = self.vault.snapshot_diff(first_known_at="2024-06-01T00:00:00Z",
+                                            second_known_at="2024-06-01T00:00:00Z")
+        self.assertEqual([], document["added"])
+        self.assertEqual([], document["removed"])
+        self.assertEqual([], document["changed"])
+
+    def test_categories_are_ordered_by_the_stable_identifier(self):
+        self.create("acct-b")
+        self.create("acct-a")
+        self.create("dev-1", entity_type="device", status="on")
+        document = self.vault.snapshot_diff(first_known_at="2024-04-01T00:00:00Z")
+        self.assertEqual([], document["removed"])
+        self.assertEqual([], document["changed"])
+        self.assertEqual(
+            [("account", "acct-a"), ("account", "acct-b"), ("device", "dev-1")],
+            [(item["type"], item["id"]) for item in document["added"]],
+        )
+        # The same query over the same data always yields the same document.
+        self.assertEqual(document, self.vault.snapshot_diff(first_known_at="2024-04-01T00:00:00Z"))
+
+    def test_batch_imported_data_takes_part_in_the_same_diff(self):
+        self.vault.run_batch(
+            {
+                "operations": [
+                    {
+                        "operation": "create",
+                        "type": "account",
+                        "id": "acct-1",
+                        "attributes": {"tier": "gold"},
+                        "valid_from": "2024-01-01T00:00:00Z",
+                    },
+                    {
+                        "operation": "correct",
+                        "type": "account",
+                        "id": "acct-1",
+                        "as_of": "2024-03-01T00:00:00Z",
+                        "facts": [{"attribute": "tier", "value": "platinum"}],
+                    },
+                ]
+            },
+            "batch-1",
+        )
+        document = self.vault.snapshot_diff(
+            "account",
+            first_as_of="2024-04-01T00:00:00Z",
+            first_known_at="2024-04-15T00:00:00Z",
+            second_as_of="2024-04-01T00:00:00Z",
+        )
+        self.assertEqual(["acct-1"], [item["id"] for item in document["added"]])
+        self.assertEqual(
+            "platinum", document["added"][0]["record"]["attributes"]["tier"]["value"]
+        )
+
+    def test_invalid_time_and_scope_arguments_are_validation_errors(self):
+        self.create("acct-1")
+        for kwargs in (
+            {"first_as_of": "yesterday"},
+            {"second_known_at": "2024-13-01T00:00:00Z"},
+            {"second_as_of": True},
+        ):
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaises(ValidationError):
+                    self.vault.snapshot_diff("account", **kwargs)
+        with self.assertRaisesRegex(ValidationError, "type"):
+            self.vault.snapshot_diff(entity_id="acct-1")
+        with self.assertRaises(ValidationError):
+            self.vault.snapshot_diff("bad type")
+        with self.assertRaises(ValidationError):
+            self.vault.snapshot_diff("account", "bad id")
+
+    def test_the_query_is_read_only(self):
+        self.create("acct-1")
+        self.clock.advance(days=30)
+        self.correct([{"attribute": "tier", "value": "platinum"}], as_of="2024-03-01T00:00:00Z")
+        before = self.vault.history("account", "acct-1")
+        self.vault.snapshot_diff("account", first_known_at="2024-05-15T00:00:00Z")
+        self.assertEqual(before, self.vault.history("account", "acct-1"))
+
+
 class HttpTests(unittest.TestCase):
     """Exercise the real socket server: routing, verbs, status codes."""
 
@@ -1261,6 +1499,44 @@ class HttpTests(unittest.TestCase):
         status, body = self.call("GET", "/diff?type=account&id=acct-1&from=2024-01-15T00:00:00Z")
         self.assertEqual(400, status)
         self.assertRegex(body["error"]["message"], "from and to")
+
+    def test_snapshot_diff_over_http(self):
+        self.call(
+            "POST",
+            "/entities/account",
+            {"id": "acct-1", "attributes": {"tier": "gold"}, "valid_from": "2024-01-01T00:00:00Z"},
+            "create-1",
+        )
+        self.clock.advance(days=30)
+        self.call(
+            "PUT",
+            "/entities/account/acct-1",
+            {"as_of": "2024-03-01T00:00:00Z", "facts": [{"attribute": "tier", "value": "platinum"}]},
+            "fix-1",
+        )
+        status, document = self.call(
+            "GET",
+            "/snapshot-diff?type=account&first_as_of=2024-04-01T00:00:00Z"
+            "&first_known_at=2024-05-15T00:00:00Z&second_as_of=2024-04-01T00:00:00Z",
+        )
+        self.assertEqual(200, status)
+        self.assertEqual([], document["added"])
+        self.assertEqual([], document["removed"])
+        self.assertEqual(["acct-1"], [item["id"] for item in document["changed"]])
+        self.assertEqual(
+            "gold", document["changed"][0]["before"]["attributes"]["tier"]["value"]
+        )
+        self.assertEqual(
+            "platinum", document["changed"][0]["after"]["attributes"]["tier"]["value"]
+        )
+
+        status, body = self.call("GET", "/snapshot-diff?id=acct-1")
+        self.assertEqual(400, status)
+        self.assertEqual("validation_error", body["error"]["code"])
+
+        status, body = self.call("GET", "/snapshot-diff?nope=1")
+        self.assertEqual(400, status)
+        self.assertRegex(body["error"]["message"], "unknown query parameter")
 
 
 if __name__ == "__main__":

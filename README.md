@@ -424,6 +424,69 @@ different version supplies it. `attribute` may be repeated to narrow the result;
 naming an attribute the entity never had is a `validation_error`. `to` must be
 strictly later than `from`, and the entity must be in effect at both instants.
 
+### Diff two snapshot facets
+
+```http
+GET /snapshot-diff?type=account&first_as_of=2024-04-01T00:00:00Z&first_known_at=2024-05-15T00:00:00Z&second_as_of=2024-04-01T00:00:00Z&second_known_at=2024-06-30T00:00:00Z
+GET /snapshot-diff?type=account&id=acct-1&first_known_at=2024-05-15T00:00:00Z
+GET /snapshot-diff
+```
+
+Compares the visible records of a scope at two **facets**, where each facet is
+an independent `(as_of, known_at)` pair evaluated under exactly the visibility
+rules of a plain read: a correction recorded after a facet's `known_at` — and
+any trim it carried — does not exist for that facet. Every coordinate defaults
+to the current instant and accepts the same forms as `as_of`/`known_at` on a
+read. The scope is optional: `type` and `id` together name one entity, `type`
+alone names every entity of that type, and no scope at all spans the whole
+store. Naming `id` without `type` is a `validation_error`.
+
+Entities are partitioned into three categories:
+
+```json
+{"first": {"as_of": "2024-04-01T00:00:00.000Z", "known_at": "2024-05-15T00:00:00.000Z"},
+ "second": {"as_of": "2024-04-01T00:00:00.000Z", "known_at": "2024-06-30T00:00:00.000Z"},
+ "added": [{"type": "account", "id": "acct-2", "record": {"type": "account", "id": "acct-2",
+            "as_of": "2024-04-01T00:00:00.000Z", "known_at": "2024-06-30T00:00:00.000Z",
+            "attributes": {"tier": {"value": "silver", "version": 1, "operation": "assert",
+                                    "valid_from": "2024-01-01T00:00:00.000Z",
+                                    "valid_end": null,
+                                    "recorded_at": "2024-06-30T00:00:00.000Z"}}}}],
+ "removed": [],
+ "changed": [{"type": "account", "id": "acct-1",
+              "before": {"type": "account", "id": "acct-1",
+                         "as_of": "2024-04-01T00:00:00.000Z",
+                         "known_at": "2024-05-15T00:00:00.000Z",
+                         "attributes": {"tier": {"value": "gold", "version": 1,
+                                                 "operation": "assert",
+                                                 "valid_from": "2024-01-01T00:00:00.000Z",
+                                                 "valid_end": null,
+                                                 "recorded_at": "2024-05-01T00:00:00.000Z"}}},
+              "after": {"type": "account", "id": "acct-1",
+                        "as_of": "2024-04-01T00:00:00.000Z",
+                        "known_at": "2024-06-30T00:00:00.000Z",
+                        "attributes": {"tier": {"value": "platinum", "version": 2,
+                                                "operation": "assert",
+                                                "valid_from": "2024-03-01T00:00:00.000Z",
+                                                "valid_end": null,
+                                                "recorded_at": "2024-05-31T00:00:00.000Z"}}}}]}
+```
+
+`added` holds the entities visible only at the second facet, each with its full
+record as the second facet sees it; `removed` holds those visible only at the
+first facet, with the first facet's record; `changed` holds those visible at
+both whose public data content differs, with both records. An entity whose
+record is the same at both facets is not part of the result. Content is what a
+read reports as data — attribute values and their valid windows — so a
+difference only in the version number that supplies a value or in the
+transaction instant it was recorded at is not a change. Each category is
+ordered by the stable `(type, id)` identifier, so repeating the query over the
+same data always yields the same document. An empty store, a scope with nothing
+in it, or two identical facets yields three empty categories rather than an
+error. The query is read-only: it appends no versions and moves no transaction
+time, and data written through `POST /batch` takes part in the same computation
+as data written one request at a time.
+
 ## Errors
 
 ```json

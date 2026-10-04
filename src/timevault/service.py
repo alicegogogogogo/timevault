@@ -12,6 +12,7 @@ from .model import (
     Entity,
     Fact,
     INFINITY,
+    identifier,
     instant,
     iso,
     parse_batch,
@@ -253,6 +254,25 @@ def project(tokens: list[Token], at: int) -> Token | None:
     return None
 
 
+def _projection_content_same(first: Projection, second: Projection) -> bool:
+    """Whether two projections carry the same public data content.
+
+    What counts is what a read reports as data: every attribute's value and
+    the valid window it holds.  The version number that supplies the value
+    and the transaction instant the row was recorded at are storage
+    bookkeeping, so they may differ freely without making the records differ.
+    """
+    if set(first) != set(second):
+        return False
+    for name in first:
+        left, right = first[name], second[name]
+        if not value_same(left[0], right[0]):
+            return False
+        if (left[2], left[3], left[4]) != (right[2], right[3], right[4]):
+            return False
+    return True
+
+
 def _value_document(entry: tuple[Any, int, str, int, int | None, int] | None) -> dict[str, Any] | None:
     if entry is None:
         return None
@@ -492,6 +512,84 @@ class TimeVault:
             "changes": changes,
         }
 
+    def snapshot_diff(
+        self,
+        entity_type: str | None = None,
+        entity_id: str | None = None,
+        first_as_of: Any = None,
+        first_known_at: Any = None,
+        second_as_of: Any = None,
+        second_known_at: Any = None,
+    ) -> dict[str, Any]:
+        """Compare the records a scope shows at two bitemporal facets.
+
+        Each facet is one ``(as_of, known_at)`` pair, evaluated under exactly
+        the visibility rules of :meth:`entity_as_of`: a correction recorded
+        after a facet's ``known_at`` — and any trim it carried — does not
+        exist for that facet.  Every coordinate defaults to the current
+        instant and accepts the same forms as the single-entity read.
+
+        The scope is the entity or collection the caller limits the
+        comparison to: a ``type`` and ``id`` name one entity, a ``type``
+        alone names every entity of that type, and no scope at all spans the
+        whole store.  Entities are partitioned into ``added`` (visible only
+        at the second facet), ``removed`` (visible only at the first), and
+        ``changed`` (visible at both but with different public data content);
+        an entity whose record is the same at both facets is not part of the
+        result.  Content is what a read reports as data — attribute values
+        and their valid windows — so a difference only in the version number
+        that supplies a value or in the transaction instant it was recorded
+        at is not a change.  Each category is ordered by the stable
+        ``(type, id)`` identifier, so repeating the query over the same data
+        always yields the same document, and an empty store, an empty scope,
+        or two identical facets simply yields three empty categories.  The
+        query is read-only: it appends no versions and moves no transaction
+        time.
+        """
+        moment = self.store.now()
+        if entity_type is not None:
+            identifier(entity_type, "entity type")
+        if entity_id is not None:
+            if entity_type is None:
+                raise ValidationError("scoping by id requires a type as well")
+            identifier(entity_id, "entity id")
+        first = (
+            moment if first_as_of is None else instant(first_as_of, "first_as_of"),
+            moment if first_known_at is None else instant(first_known_at, "first_known_at"),
+        )
+        second = (
+            moment if second_as_of is None else instant(second_as_of, "second_as_of"),
+            moment if second_known_at is None else instant(second_known_at, "second_known_at"),
+        )
+        # Hold the lock across both snapshots so a write cannot commit between
+        # them: the two facets are always evaluated against one ledger, never
+        # against two halves of a commit in flight.
+        with self.store.lock:
+            before = self._snapshot(entity_type, entity_id, *first)
+            after = self._snapshot(entity_type, entity_id, *second)
+        added: list[dict[str, Any]] = []
+        removed: list[dict[str, Any]] = []
+        changed: list[dict[str, Any]] = []
+        for type_name, entity in sorted(set(before) | set(after)):
+            key = (type_name, entity)
+            earlier = before.get(key)
+            later = after.get(key)
+            if earlier is None:
+                added.append({"type": type_name, "id": entity, "record": later[1]})
+            elif later is None:
+                removed.append({"type": type_name, "id": entity, "record": earlier[1]})
+            elif not _projection_content_same(earlier[0], later[0]):
+                changed.append(
+                    {"type": type_name, "id": entity, "before": earlier[1], "after": later[1]}
+                )
+        return {
+            "first": {"as_of": iso(first[0]), "known_at": iso(first[1])},
+            "second": {"as_of": iso(second[0]), "known_at": iso(second[1])},
+            "added": added,
+            "removed": removed,
+            "changed": changed,
+        }
+
     # -- internals ----------------------------------------------------------
 
     def _create_core(
@@ -652,6 +750,17 @@ class TimeVault:
         required: bool = True,
     ) -> dict[str, Any]:
         projection = self._projection(entity_type, entity_id, as_of, known_at, required)
+        return self._projection_document(entity_type, entity_id, as_of, known_at, projection)
+
+    def _projection_document(
+        self,
+        entity_type: str,
+        entity_id: str,
+        as_of: int,
+        known_at: int,
+        projection: Projection,
+    ) -> dict[str, Any]:
+        """Render a projection as the public record a read reports."""
         attributes = {
             name: {
                 "value": entry[0],
@@ -670,6 +779,36 @@ class TimeVault:
             "known_at": iso(known_at),
             "attributes": attributes,
         }
+
+    def _snapshot(
+        self,
+        entity_type: str | None,
+        entity_id: str | None,
+        as_of: int,
+        known_at: int,
+    ) -> dict[tuple[str, str], tuple[Projection, dict[str, Any]]]:
+        """The visible record of every in-scope entity at one facet.
+
+        An entity contributes its record only when the facet can see it:
+        recorded no later than the facet's ``known_at`` and holding at least
+        one attribute in effect at its ``as_of``.  Anything else — an empty
+        store, a scope nothing falls in, an entity the facet predates, an
+        entity with nothing in effect — is simply absent, which is what lets
+        an empty diff come back as empty categories rather than an error.
+        """
+        records: dict[tuple[str, str], tuple[Projection, dict[str, Any]]] = {}
+        for type_name, entity, created_at in self.store.entity_keys(entity_type, entity_id):
+            if created_at > known_at:
+                # The facet's transaction instant predates the entity itself.
+                continue
+            projection = self._projection(type_name, entity, as_of, known_at, required=False)
+            if not projection:
+                continue
+            records[(type_name, entity)] = (
+                projection,
+                self._projection_document(type_name, entity, as_of, known_at, projection),
+            )
+        return records
 
     def _projection(
         self, entity_type: str, entity_id: str, as_of: int, known_at: int, required: bool = True

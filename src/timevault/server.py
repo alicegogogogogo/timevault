@@ -82,6 +82,8 @@ def make_handler(service: TimeVault) -> type[BaseHTTPRequestHandler]:
                 return 200, service.run_batch(self._body(), key)
             if parts == ["diff"]:
                 return self._diff(query)
+            if parts == ["snapshot-diff"]:
+                return self._snapshot_diff(query)
             if parts and parts[0] == "entities":
                 return self._entity_routes(parts[1:], query, key)
             raise NotFoundError("route was not found")
@@ -137,6 +139,22 @@ def make_handler(service: TimeVault) -> type[BaseHTTPRequestHandler]:
                 instant(raw_to, "to"),
                 self._instant_parameter(query, "known_at"),
                 names,
+            )
+
+        def _snapshot_diff(self, query: dict[str, list[str]]) -> tuple[int, Any]:
+            if self.command != "GET":
+                raise NotFoundError("route was not found")
+            only(
+                query,
+                {"type", "id", "first_as_of", "first_known_at", "second_as_of", "second_known_at"},
+            )
+            return 200, service.snapshot_diff(
+                one(query, "type"),
+                one(query, "id"),
+                self._instant_parameter(query, "first_as_of"),
+                self._instant_parameter(query, "first_known_at"),
+                self._instant_parameter(query, "second_as_of"),
+                self._instant_parameter(query, "second_known_at"),
             )
 
         def _handle(self) -> None:
