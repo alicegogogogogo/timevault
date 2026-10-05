@@ -487,6 +487,64 @@ error. The query is read-only: it appends no versions and moves no transaction
 time, and data written through `POST /batch` takes part in the same computation
 as data written one request at a time.
 
+### Compare two historical views (library API)
+
+```python
+from timevault import TimeVault, Viewpoint
+
+vault.compare_views(
+    Viewpoint(as_of="2024-02-01T00:00:00Z", known_at="2024-05-15T00:00:00Z"),
+    Viewpoint(as_of="2024-04-01T00:00:00Z", known_at="2024-06-30T00:00:00Z"),
+    record_ids=[("account", "acct-1")],  # optional: every record when omitted
+)
+```
+
+`TimeVault.compare_views` compares two complete viewpoints, each one an
+explicit `(valid time, transaction time)` pair evaluated under exactly the
+visibility rules of a plain read: a version is present only when it holds at
+the viewpoint's valid time, was already knowable at its transaction time, and
+had not been withdrawn then, so a correction recorded later can never leak
+into the earlier view. The optional `record_ids` is an iterable collection of
+`(type, id)` pairs; when omitted every logical record in the store takes part.
+
+The response carries both viewpoints and a flat `differences` list, stably
+ordered by `(type, id)`:
+
+```json
+{"left": {"as_of": "2024-02-01T00:00:00.000Z", "known_at": "2024-05-15T00:00:00.000Z"},
+ "right": {"as_of": "2024-04-01T00:00:00.000Z", "known_at": "2024-06-30T00:00:00.000Z"},
+ "differences": [
+   {"type": "account", "id": "acct-1", "difference": "changed",
+    "left": {"type": "account", "id": "acct-1", "as_of": "…", "known_at": "…",
+             "attributes": {"tier": {"value": "gold", "version": 1, "operation": "assert",
+                                     "valid_from": "2024-01-01T00:00:00.000Z",
+                                     "valid_end": null,
+                                     "recorded_at": "2024-05-01T00:00:00.000Z"}}},
+    "right": {"type": "account", "id": "acct-1", "as_of": "…", "known_at": "…",
+              "attributes": {"tier": {"value": "platinum", "version": 2, "operation": "assert",
+                                      "valid_from": "2024-03-01T00:00:00.000Z",
+                                      "valid_end": null,
+                                      "recorded_at": "2024-05-31T00:00:00.000Z"}}}}]}
+```
+
+`difference` is `added` when the record is visible only on the right (the
+`left` document is `null`), `removed` when visible only on the left (the
+`right` document is `null`), and `changed` when both are visible but the
+business values or any public version metadata differ. A correction, an
+interval split, or a retraction appears only when it changes the version a
+side ultimately observes — never as an internal intermediate version. Two
+identical viewpoints, an empty store, and records identical on both sides
+yield an empty list; duplicate identifiers are compared once and identifiers
+that name no record produce nothing.
+
+Both sides read against the single committed state at the call's start, so a
+concurrent write cannot split the two views. The call is strictly read-only:
+it appends no versions, moves no transaction time, and never mutates the
+caller's identifier collection. A viewpoint missing either coordinate or
+carrying a value the instant parser rejects raises `ValueError`; a
+`record_ids` argument that is not an iterable collection, or whose elements
+are not well-formed `(type, id)` identifiers, raises `TypeError`.
+
 ### Trace ledger changes
 
 ```http

@@ -4,6 +4,7 @@ import base64
 import binascii
 import hashlib
 import json
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -23,6 +24,11 @@ from .model import (
     value_same,
 )
 from .store import ACTION_VERSION_APPENDED, ACTION_WINDOW_TRUNCATED, Store
+
+# Difference tags returned by :meth:`TimeVault.compare_views`.
+DIFF_ADDED = "added"
+DIFF_REMOVED = "removed"
+DIFF_CHANGED = "changed"
 
 DEFAULT_AUDIT_LIMIT = 100
 MAX_AUDIT_LIMIT = 500
@@ -437,6 +443,104 @@ def _batch_operation_name(raw: Any) -> str:
     return f"batch:{digest}"
 
 
+@dataclass(frozen=True)
+class Viewpoint:
+    """One complete read point: a valid instant and a transaction instant.
+
+    Both coordinates are required, unlike the HTTP read parameters, because a
+    historical comparison has no sensible "current instant" default to fall
+    back on: the caller names the belief state of each side explicitly.  Each
+    coordinate accepts the same forms as ``as_of``/``known_at`` on a plain
+    read (an RFC 3339 string, integer epoch milliseconds, or float epoch
+    seconds) or an aware :class:`datetime.datetime`.
+    """
+
+    as_of: Any
+    known_at: Any
+
+
+def _viewpoint_coordinates(viewpoint: Any, side: str) -> tuple[int, int]:
+    """Validate one viewpoint and normalise both coordinates to milliseconds.
+
+    A missing coordinate, or a value the shared instant parser rejects, is a
+    :class:`ValueError`: the comparison entry point speaks the caller's
+    Python-level error contract rather than the HTTP ``ValidationError``
+    envelope.  ``None`` is rejected explicitly before the instant parser sees
+    it so that "the caller did not name a coordinate" reports as such.
+    """
+    if not isinstance(viewpoint, Viewpoint):
+        raise ValueError(f"{side} viewpoint must be a Viewpoint")
+    if viewpoint.as_of is None:
+        raise ValueError(f"{side} viewpoint requires an as_of (valid time) instant")
+    if viewpoint.known_at is None:
+        raise ValueError(f"{side} viewpoint requires a known_at (transaction time) instant")
+    try:
+        as_of = instant(viewpoint.as_of, f"{side} as_of")
+        known_at = instant(viewpoint.known_at, f"{side} known_at")
+    except ValidationError as error:
+        raise ValueError(str(error)) from error
+    return as_of, known_at
+
+
+def _record_identifiers(record_ids: Any) -> list[tuple[str, str]] | None:
+    """Validate the optional logical-record filter.
+
+    The filter is an iterable collection of ``(type, id)`` pairs; ``None``
+    means every logical record in the store.  Something that is not iterable
+    at all, or that looks like one identifier rather than a collection of
+    them (a string or bytes), is a :class:`TypeError`, as is any element that
+    does not satisfy the existing type/id identifier constraints.  Duplicate
+    identifiers are dropped here, so each logical record is compared exactly
+    once.
+    """
+    if record_ids is None:
+        return None
+    if isinstance(record_ids, (str, bytes)) or not isinstance(record_ids, Iterable):
+        raise TypeError("record_ids must be an iterable collection of (type, id) pairs")
+    unique: set[tuple[str, str]] = set()
+    for element in record_ids:
+        if (
+            not isinstance(element, tuple)
+            or len(element) != 2
+            or not all(isinstance(part, str) for part in element)
+        ):
+            raise TypeError("each record id must be a (type, id) pair of strings")
+        entity_type, entity_id = element
+        try:
+            identifier(entity_type, "entity type")
+            identifier(entity_id, "entity id")
+        except ValidationError as error:
+            raise TypeError(str(error)) from error
+        unique.add((entity_type, entity_id))
+    return sorted(unique)
+
+
+def _projection_record_same(first: Projection, second: Projection) -> bool:
+    """Whether two visible records are the same public record.
+
+    Every observable feature of a read counts: the set of attributes in
+    effect, each attribute's business value, and the full public version
+    metadata — version number, operation, the window as the reader sees it,
+    and the transaction instant the version was recorded at.  A correction,
+    an interval split, or a retraction therefore registers as a change
+    whenever it moves what either side ultimately observes, even when the
+    business value happens to be the same; intermediate versions that neither
+    viewpoint sees never enter the comparison.
+    """
+    if set(first) != set(second):
+        return False
+    for name in first:
+        left, right = first[name], second[name]
+        # Values go through the store's own equality so a boolean and a number
+        # stay distinct (Python itself would equate ``true`` and ``1``); the
+        # remaining tuple fields are exactly the public version metadata.
+        if not value_same(left[0], right[0]):
+            return False
+        if left[1:] != right[1:]:
+            return False
+    return True
+
+
 class TimeVault:
     """Bitemporal entity store: valid time on one axis, transaction time on the other."""
 
@@ -726,6 +830,98 @@ class TimeVault:
             "added": added,
             "removed": removed,
             "changed": changed,
+        }
+
+    def compare_views(
+        self,
+        left: Viewpoint,
+        right: Viewpoint,
+        record_ids: Iterable[tuple[str, str]] | None = None,
+    ) -> dict[str, Any]:
+        """Compare the visible records at two complete bitemporal viewpoints.
+
+        Each viewpoint is one :class:`Viewpoint` carrying both an ``as_of``
+        (valid time) and a ``known_at`` (transaction time); both coordinates
+        are required and must satisfy the same instant constraints as a
+        plain read's parameters.  ``record_ids`` optionally narrows the
+        comparison to an iterable collection of ``(type, id)`` logical
+        record identifiers; when it is omitted every logical record in the
+        store is compared.
+
+        Each side is evaluated under exactly the visibility rules of a plain
+        read: only versions in effect at that side's valid time, already
+        knowable at its transaction time, and not withdrawn then are visible,
+        so a later correction never leaks into the earlier view.  The result
+        is one flat, stable list ordered by ``(type, id)``: ``added`` entries
+        are visible only on the right, ``removed`` only on the left, and
+        ``changed`` entries are visible on both but differ in business value
+        or in any public version metadata.  Entries whose content and
+        observable version metadata are identical on both sides are omitted;
+        the missing side of an addition or removal is reported as ``null``.
+        Repeated identifiers are compared once, and identifiers that name no
+        record produce nothing.
+
+        Both sides are read inside one acquisition of the store lock, so they
+        always observe the same committed state — a write that commits
+        concurrently cannot land between the two reads.  The comparison is
+        strictly read-only and never mutates the caller's identifier
+        collection.
+        """
+        left_coords = _viewpoint_coordinates(left, "left")
+        right_coords = _viewpoint_coordinates(right, "right")
+        wanted = _record_identifiers(record_ids)
+
+        with self.store.lock:
+            # One lock acquisition spans both viewpoints: every other writer
+            # takes this same lock across its whole transaction, so the two
+            # sides can never straddle a commit boundary.
+            if wanted is None:
+                keys = [(type_name, entity) for type_name, entity, _ in self.store.entity_keys()]
+            else:
+                keys = wanted
+            before: dict[tuple[str, str], tuple[Projection, dict[str, Any]]] = {}
+            after: dict[tuple[str, str], tuple[Projection, dict[str, Any]]] = {}
+            for type_name, entity in keys:
+                left_record = self._visible_record(type_name, entity, *left_coords)
+                if left_record is not None:
+                    before[(type_name, entity)] = left_record
+                right_record = self._visible_record(type_name, entity, *right_coords)
+                if right_record is not None:
+                    after[(type_name, entity)] = right_record
+
+        differences: list[dict[str, Any]] = []
+        for key in sorted(set(before) | set(after)):
+            type_name, entity = key
+            earlier = before.get(key)
+            later = after.get(key)
+            if earlier is None:
+                kind = DIFF_ADDED
+                left_document: dict[str, Any] | None = None
+                right_document = later[1]  # type: ignore[union-attr]
+            elif later is None:
+                kind = DIFF_REMOVED
+                left_document = earlier[1]
+                right_document = None
+            elif not _projection_record_same(earlier[0], later[0]):
+                kind = DIFF_CHANGED
+                left_document = earlier[1]
+                right_document = later[1]
+            else:
+                # The same observable record on both sides: no difference.
+                continue
+            differences.append(
+                {
+                    "type": type_name,
+                    "id": entity,
+                    "difference": kind,
+                    "left": left_document,
+                    "right": right_document,
+                }
+            )
+        return {
+            "left": {"as_of": iso(left_coords[0]), "known_at": iso(left_coords[1])},
+            "right": {"as_of": iso(right_coords[0]), "known_at": iso(right_coords[1])},
+            "differences": differences,
         }
 
     def audit(
@@ -1110,14 +1306,33 @@ class TimeVault:
             if created_at > known_at:
                 # The facet's transaction instant predates the entity itself.
                 continue
-            projection = self._projection(type_name, entity, as_of, known_at, required=False)
-            if not projection:
-                continue
-            records[(type_name, entity)] = (
-                projection,
-                self._projection_document(type_name, entity, as_of, known_at, projection),
-            )
+            record = self._visible_record(type_name, entity, as_of, known_at)
+            if record is not None:
+                records[(type_name, entity)] = record
         return records
+
+    def _visible_record(
+        self,
+        entity_type: str,
+        entity_id: str,
+        as_of: int,
+        known_at: int,
+    ) -> tuple[Projection, dict[str, Any]] | None:
+        """One entity's record as a facet sees it, or ``None`` when invisible.
+
+        The projection is built by the same ``_projection`` path every other
+        read uses, so the visibility rules for unknowable corrections, trims,
+        and retractions are reused verbatim rather than reimplemented.
+        """
+        row = self.store.entity_row(entity_type, entity_id)
+        if row is None or int(row["created_at"]) > known_at:
+            return None
+        projection = self._projection(entity_type, entity_id, as_of, known_at, required=False)
+        if not projection:
+            return None
+        return projection, self._projection_document(
+            entity_type, entity_id, as_of, known_at, projection
+        )
 
     def _projection(
         self, entity_type: str, entity_id: str, as_of: int, known_at: int, required: bool = True

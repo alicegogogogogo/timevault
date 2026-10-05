@@ -1,5 +1,5 @@
 """TimeVault public package."""
 
-from .service import TimeVault
+from .service import TimeVault, Viewpoint
 
-__all__ = ["TimeVault"]
+__all__ = ["TimeVault", "Viewpoint"]
