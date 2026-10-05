@@ -4,6 +4,7 @@ import base64
 import binascii
 import hashlib
 import json
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -411,6 +412,55 @@ def _projection_content_same(first: Projection, second: Projection) -> bool:
     return True
 
 
+def _projection_identical(first: Projection, second: Projection) -> bool:
+    """Whether two projections agree on content and public version metadata.
+
+    Unlike :func:`_projection_content_same`, which treats the version number
+    and the recorded instant as storage bookkeeping, this comparison counts
+    everything a read reports about the version that supplies each value —
+    its number, operation, valid window, and recorded instant — so a
+    correction that merely restates a value with an identical one still
+    makes the two views differ.
+    """
+    if set(first) != set(second):
+        return False
+    for name in first:
+        left, right = first[name], second[name]
+        if not value_same(left[0], right[0]):
+            return False
+        if left[1:] != right[1:]:
+            return False
+    return True
+
+
+def _view_id_filter(ids: Any) -> set[str] | None:
+    """Validate the optional identifier filter of a view diff.
+
+    The filter must be an iterable of entity identifiers.  It is copied into
+    a new set, so the caller's own collection is never mutated and duplicate
+    identifiers collapse into one comparison.  Anything else — a
+    non-iterable, a bare string, or an element that is not a valid
+    identifier — is a ``TypeError`` raised before any record is read, so a
+    bad filter can never yield a partial result.
+    """
+    if ids is None:
+        return None
+    if isinstance(ids, (str, bytes)) or not isinstance(ids, Iterable):
+        raise TypeError("ids must be an iterable of entity identifiers")
+    wanted: set[str] = set()
+    for element in ids:
+        if not isinstance(element, str):
+            raise TypeError("ids must contain only entity identifier strings")
+        try:
+            identifier(element, "id")
+        except ValidationError as error:
+            raise TypeError(
+                f"ids must contain only valid entity identifiers: {error}"
+            ) from error
+        wanted.add(element)
+    return wanted
+
+
 def _value_document(entry: tuple[Any, int, str, int, int | None, int] | None) -> dict[str, Any] | None:
     if entry is None:
         return None
@@ -727,6 +777,107 @@ class TimeVault:
             "removed": removed,
             "changed": changed,
         }
+
+    def view_diff(
+        self,
+        left_as_of: Any = None,
+        left_known_at: Any = None,
+        right_as_of: Any = None,
+        right_known_at: Any = None,
+        ids: Any = None,
+    ) -> dict[str, Any]:
+        """Compare the records two historical views show over one ledger.
+
+        Each view is one ``(as_of, known_at)`` pair — a valid-time instant
+        and a transaction-time instant — and both coordinates of both views
+        are required: a missing coordinate, or one that violates the instant
+        constraints every other query accepts, is a ``ValueError``.  ``ids``
+        is an optional iterable of entity identifiers narrowing the
+        comparison; when it is omitted every entity in the store takes part.
+        A filter that is not an iterable of identifiers, or that holds an
+        element which is not a valid identifier, is a ``TypeError`` raised
+        before anything is read, so a bad call never yields a partial
+        result.
+
+        Each side is evaluated under exactly the visibility rules of
+        :meth:`entity_as_of`: a version shows only when it holds at the
+        view's ``as_of``, was recorded no later than its ``known_at``, and
+        was not retracted by then, and a correction recorded after a view's
+        ``known_at`` — including any trim it carried — does not exist for
+        that view.
+
+        The result lists one entry per entity whose visible record differs,
+        ordered by the entity identifier (the type breaks ties), so the same
+        data and arguments always yield the same document.  ``change`` is
+        ``added`` when the record is visible only on the right, ``removed``
+        when only on the left, and ``changed`` when both sides see it but
+        the business values or the public version metadata — version number,
+        operation, valid window, recorded instant — differ; an entity whose
+        record, content and observable version information alike, is
+        identical on both sides is not part of the result, so two identical
+        views produce an empty ``changes`` list.  Each entry carries the
+        full public record of both sides under ``left`` and ``right``, with
+        the side the record is missing from explicitly ``None``.  Duplicate
+        identifiers in the filter are compared once, identifiers no entity
+        has produce no entries, and a correction, a window split, or a
+        retraction shows up exactly when it changes the version a side
+        finally sees — never as an internal intermediate version.
+
+        Both views are read under one lock acquisition, so a concurrent
+        write cannot make the two sides observe different commit boundaries,
+        and the query itself is strictly read-only: it appends no versions,
+        moves no transaction time, and never touches the caller's filter
+        collection.
+        """
+        if left_as_of is None:
+            raise ValidationError("left_as_of is required")
+        if left_known_at is None:
+            raise ValidationError("left_known_at is required")
+        if right_as_of is None:
+            raise ValidationError("right_as_of is required")
+        if right_known_at is None:
+            raise ValidationError("right_known_at is required")
+        left = (instant(left_as_of, "left_as_of"), instant(left_known_at, "left_known_at"))
+        right = (instant(right_as_of, "right_as_of"), instant(right_known_at, "right_known_at"))
+        wanted = _view_id_filter(ids)
+        # Hold the lock across both views so a write cannot commit between
+        # them: the two sides are always evaluated against one committed
+        # state of the ledger, never against two halves of a commit in
+        # flight.
+        with self.store.lock:
+            before = self._view_records(wanted, *left)
+            after = self._view_records(wanted, *right)
+        changes: list[dict[str, Any]] = []
+        keys = sorted(set(before) | set(after), key=lambda key: (key[1], key[0]))
+        for type_name, entity_id in keys:
+            earlier = before.get((type_name, entity_id))
+            later = after.get((type_name, entity_id))
+            if earlier is None:
+                kind = "added"
+            elif later is None:
+                kind = "removed"
+            elif _projection_identical(earlier[0], later[0]):
+                continue
+            else:
+                kind = "changed"
+            changes.append(
+                {
+                    "type": type_name,
+                    "id": entity_id,
+                    "change": kind,
+                    "left": None if earlier is None else earlier[1],
+                    "right": None if later is None else later[1],
+                }
+            )
+        return {
+            "left": {"as_of": iso(left[0]), "known_at": iso(left[1])},
+            "right": {"as_of": iso(right[0]), "known_at": iso(right[1])},
+            "changes": changes,
+        }
+
+    # The same operation under its alternate name: both views are views over
+    # the ledger's history, so ``history_diff`` is kept as a public alias.
+    history_diff = view_diff
 
     def audit(
         self,
@@ -1109,6 +1260,36 @@ class TimeVault:
         for type_name, entity, created_at in self.store.entity_keys(entity_type, entity_id):
             if created_at > known_at:
                 # The facet's transaction instant predates the entity itself.
+                continue
+            projection = self._projection(type_name, entity, as_of, known_at, required=False)
+            if not projection:
+                continue
+            records[(type_name, entity)] = (
+                projection,
+                self._projection_document(type_name, entity, as_of, known_at, projection),
+            )
+        return records
+
+    def _view_records(
+        self, wanted: set[str] | None, as_of: int, known_at: int
+    ) -> dict[tuple[str, str], tuple[Projection, dict[str, Any]]]:
+        """The visible record of every in-scope entity at one historical view.
+
+        This mirrors :meth:`_snapshot`, with the scope given as a set of
+        entity identifiers rather than a type/id prefix: an entity takes
+        part when the filter is absent or names its identifier.  Visibility
+        itself is the ordinary read rule — the entity must be recorded no
+        later than the view's ``known_at`` and hold at least one attribute
+        in effect at its ``as_of``; anything else is simply absent, which is
+        what lets an empty diff come back as an empty list rather than an
+        error.
+        """
+        records: dict[tuple[str, str], tuple[Projection, dict[str, Any]]] = {}
+        for type_name, entity, created_at in self.store.entity_keys():
+            if wanted is not None and entity not in wanted:
+                continue
+            if created_at > known_at:
+                # The view's transaction instant predates the entity itself.
                 continue
             projection = self._projection(type_name, entity, as_of, known_at, required=False)
             if not projection:

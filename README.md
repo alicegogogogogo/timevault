@@ -487,6 +487,81 @@ error. The query is read-only: it appends no versions and moves no transaction
 time, and data written through `POST /batch` takes part in the same computation
 as data written one request at a time.
 
+### Diff two historical views
+
+```http
+GET /view-diff?left_as_of=2024-04-01T00:00:00Z&left_known_at=2024-05-15T00:00:00Z&right_as_of=2024-04-01T00:00:00Z&right_known_at=2024-06-30T00:00:00Z
+GET /view-diff?left_as_of=...&left_known_at=...&right_as_of=...&right_known_at=...&id=acct-1&id=acct-3
+```
+
+`TimeVault.view_diff(left_as_of, left_known_at, right_as_of, right_known_at, ids=None)`
+— also available under the alias `history_diff` — compares the records of the
+store at two **views**, where each view is a complete `(as_of, known_at)`
+pair: a valid-time instant and a transaction-time instant. Unlike
+`snapshot_diff`, every coordinate is required; a missing coordinate or one
+that violates the instant constraints of a plain read raises `ValueError`
+(the same `validation_error` over HTTP). Each side is evaluated under exactly
+the visibility rules of a plain read: a version shows only when it holds at
+the view's `as_of`, was recorded no later than its `known_at`, and was not
+retracted by then, and a correction recorded after a view's `known_at` —
+including any trim it carried — does not exist for that view.
+
+`ids` is an optional iterable of entity identifiers narrowing the comparison
+(the `id` query parameter may be repeated); when it is omitted, every entity
+in the store takes part. A filter that is not an iterable of identifiers, or
+that holds an element which is not a valid identifier, raises `TypeError`
+before anything is read, so a bad call never yields a partial result.
+Duplicate identifiers are compared once, identifiers no entity has produce no
+entries, and the caller's collection is never mutated.
+
+The result lists one entry per entity whose visible record differs, ordered
+by the entity identifier (the type breaks ties), so the same data and
+arguments always yield the same document:
+
+```json
+{"left": {"as_of": "2024-04-01T00:00:00.000Z", "known_at": "2024-05-15T00:00:00.000Z"},
+ "right": {"as_of": "2024-04-01T00:00:00.000Z", "known_at": "2024-06-30T00:00:00.000Z"},
+ "changes": [
+   {"type": "account", "id": "acct-1", "change": "changed",
+    "left": {"type": "account", "id": "acct-1",
+             "as_of": "2024-04-01T00:00:00.000Z", "known_at": "2024-05-15T00:00:00.000Z",
+             "attributes": {"tier": {"value": "gold", "version": 1, "operation": "assert",
+                                     "valid_from": "2024-01-01T00:00:00.000Z",
+                                     "valid_end": null,
+                                     "recorded_at": "2024-05-01T00:00:00.000Z"}}},
+    "right": {"type": "account", "id": "acct-1",
+              "as_of": "2024-04-01T00:00:00.000Z", "known_at": "2024-06-30T00:00:00.000Z",
+              "attributes": {"tier": {"value": "platinum", "version": 2, "operation": "assert",
+                                      "valid_from": "2024-03-01T00:00:00.000Z",
+                                      "valid_end": null,
+                                      "recorded_at": "2024-05-31T00:00:00.000Z"}}}},
+   {"type": "account", "id": "acct-2", "change": "removed",
+    "left": {"type": "account", "id": "acct-2", "...": "..."},
+    "right": null},
+   {"type": "account", "id": "acct-3", "change": "added",
+    "left": null,
+    "right": {"type": "account", "id": "acct-3", "...": "..."}}]}
+```
+
+`change` is `added` when the record is visible only on the right, `removed`
+when only on the left, and `changed` when both sides see it but the business
+values or the public version metadata — version number, operation, valid
+window, recorded instant — differ. This is deliberately stricter than
+`snapshot_diff`: a correction that restates a value with an identical one
+still moves the version number and the recorded instant, so it shows up as
+`changed` here. An entity whose record, content and observable version
+information alike, is identical on both sides is not part of the result, so
+two identical views produce an empty `changes` list. Each entry carries the
+full public record of both sides under `left` and `right`, with the side the
+record is missing from explicitly `null`. A correction, a window split, or a
+retraction shows up exactly when it changes the version a side finally sees —
+never as an internal intermediate version.
+
+Both views are read against the committed state at the moment of the call — a
+concurrent write cannot make the two sides observe different commit
+boundaries — and the query itself is strictly read-only: it appends no
+versions and moves no transaction time.
+
 ### Trace ledger changes
 
 ```http

@@ -84,6 +84,8 @@ def make_handler(service: TimeVault) -> type[BaseHTTPRequestHandler]:
                 return self._diff(query)
             if parts == ["snapshot-diff"]:
                 return self._snapshot_diff(query)
+            if parts == ["view-diff"]:
+                return self._view_diff(query)
             if parts == ["audit"]:
                 return self._audit(query)
             if parts and parts[0] == "entities":
@@ -158,6 +160,27 @@ def make_handler(service: TimeVault) -> type[BaseHTTPRequestHandler]:
                 self._instant_parameter(query, "second_as_of"),
                 self._instant_parameter(query, "second_known_at"),
             )
+
+        def _view_diff(self, query: dict[str, list[str]]) -> tuple[int, Any]:
+            if self.command != "GET":
+                raise NotFoundError("route was not found")
+            only(
+                query,
+                {"left_as_of", "left_known_at", "right_as_of", "right_known_at", "id"},
+            )
+            try:
+                return 200, service.view_diff(
+                    left_as_of=one(query, "left_as_of"),
+                    left_known_at=one(query, "left_known_at"),
+                    right_as_of=one(query, "right_as_of"),
+                    right_known_at=one(query, "right_known_at"),
+                    ids=many(query, "id"),
+                )
+            except (ValueError, TypeError) as error:
+                # The service reports a bad viewpoint as a value error and a
+                # bad identifier filter as a type error; over HTTP both are
+                # validation errors.
+                raise ValidationError(str(error)) from error
 
         def _audit(self, query: dict[str, list[str]]) -> tuple[int, Any]:
             if self.command != "GET":

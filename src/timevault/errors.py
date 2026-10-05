@@ -3,7 +3,16 @@ class TimeVaultError(Exception):
     status = 500
 
 
-class ValidationError(TimeVaultError):
+class ValidationError(TimeVaultError, ValueError):
+    """A request that violates the public constraints of an entry point.
+
+    It is also a :class:`ValueError`, so a caller that follows the documented
+    contract of the read APIs — bad coordinates are value errors — can catch
+    the built-in category without depending on this concrete subclass.  Every
+    existing ``except ValidationError`` and ``except TimeVaultError`` clause
+    behaves exactly as before.
+    """
+
     code = "validation_error"
     status = 400
 
