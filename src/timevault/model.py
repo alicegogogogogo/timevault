@@ -180,6 +180,54 @@ class Entity:
         }
 
 
+SCHEMA_TYPES = ("string", "number", "boolean", "null")
+"""The attribute types a schema may declare."""
+
+
+@dataclass(frozen=True)
+class Schema:
+    """One version of the attribute contract of an entity type.
+
+    ``effective_from`` is the business instant the contract starts holding;
+    it must not lie after the transaction instant the schema is submitted at.
+    ``attributes`` maps every declared attribute name to the exact type its
+    assertions must carry, sorted by name so the stored form is deterministic.
+    An empty mapping is allowed: it declares that no attribute may appear.
+    """
+
+    entity_type: str
+    effective_from: int
+    attributes: tuple[tuple[str, str], ...]
+
+    @classmethod
+    def parse(cls, entity_type: Any, raw: Any, now: int) -> "Schema":
+        if not isinstance(raw, dict):
+            raise ValidationError("request body must be a JSON object")
+        unknown = sorted(set(raw) - {"effective_from", "attributes"})
+        if unknown:
+            raise ValidationError(f"unknown field(s): {', '.join(unknown)}")
+        for required in ("effective_from", "attributes"):
+            if required not in raw:
+                raise ValidationError(f"{required} is required")
+        effective_from = instant(raw["effective_from"], "effective_from")
+        if effective_from > now:
+            raise ValidationError("effective_from must not be in the future")
+        raw_attributes = raw["attributes"]
+        if not isinstance(raw_attributes, dict):
+            raise ValidationError("attributes must be an object")
+        attributes = []
+        for name, kind in raw_attributes.items():
+            attribute_name(name)
+            if kind not in SCHEMA_TYPES:
+                raise ValidationError(
+                    f"attribute {name}: type must be one of {', '.join(SCHEMA_TYPES)}"
+                )
+            attributes.append((name, kind))
+        return cls(
+            identifier(entity_type, "entity type"), effective_from, tuple(sorted(attributes))
+        )
+
+
 @dataclass(frozen=True)
 class Fact:
     """One requested change to a single attribute over a valid window.

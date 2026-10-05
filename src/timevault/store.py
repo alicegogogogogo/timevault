@@ -80,6 +80,14 @@ class Store:
               operation TEXT NOT NULL,
               response TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS schemas (
+              type TEXT NOT NULL,
+              version INTEGER NOT NULL,
+              effective_from INTEGER NOT NULL,
+              recorded_at INTEGER NOT NULL,
+              attributes TEXT NOT NULL,
+              PRIMARY KEY (type, version)
+            );
             CREATE TABLE IF NOT EXISTS audit_events (
               seq INTEGER PRIMARY KEY AUTOINCREMENT,
               event_id TEXT NOT NULL UNIQUE,
@@ -532,8 +540,53 @@ class Store:
             ),
         )
 
-    # -- idempotency --------------------------------------------------------
+    # -- schemas ------------------------------------------------------------
 
+    def insert_schema(
+        self,
+        entity_type: str,
+        version: int,
+        effective_from: int,
+        recorded_at: int,
+        attributes: dict[str, str],
+    ) -> None:
+        """Append one schema version; existing versions are never touched."""
+        self.connection.execute(
+            """
+            INSERT INTO schemas(type, version, effective_from, recorded_at, attributes)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (entity_type, version, effective_from, recorded_at, self.encode(attributes)),
+        )
+
+    def schemas_for_type(self, entity_type: str) -> list[sqlite3.Row]:
+        """Every committed schema version of the type, oldest first."""
+        with self.lock:
+            return list(
+                self.connection.execute(
+                    """
+                    SELECT version, effective_from, recorded_at, attributes
+                      FROM schemas
+                     WHERE type = ?
+                     ORDER BY version
+                    """,
+                    (entity_type,),
+                ).fetchall()
+            )
+
+    def next_schema_version(self, entity_type: str) -> int:
+        with self.lock:
+            row = self.connection.execute(
+                """
+                SELECT COALESCE(MAX(version), 0) + 1 AS next
+                  FROM schemas
+                 WHERE type = ?
+                """,
+                (entity_type,),
+            ).fetchone()
+        return int(row["next"])
+
+    # -- idempotency --------------------------------------------------------
     def idempotent_response(self, key: str, operation: str) -> dict[str, Any] | None:
         row = self.connection.execute(
             "SELECT operation, response FROM idempotency WHERE key = ?", (key,)

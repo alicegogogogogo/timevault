@@ -320,6 +320,79 @@ Replaying a key returns the first batch's stored 200 response and writes
 nothing, so replayed batches add no versions; reusing a key for a different
 batch request is a `conflict`.
 
+### Manage a type's schema
+
+```http
+PUT /schemas/account
+Idempotency-Key: schema-1
+
+{
+  "effective_from": "2024-01-01T00:00:00Z",
+  "attributes": {"tier": "string", "level": "number"}
+}
+```
+
+```http
+GET /schemas/account
+GET /schemas/account?as_of=2024-02-01T00:00:00Z&known_at=2024-05-15T00:00:00Z
+```
+
+A schema is the attribute contract of one entity type, versioned on the same
+two axes as facts: `effective_from` is the business instant the contract
+starts holding (it accepts every time form a fact's coordinates accept and
+must not be later than the submission's transaction instant), and
+`recorded_at` is the instant the schema was submitted. `attributes` maps each
+declared attribute name to exactly one of `string`, `number`, `boolean`, or
+`null`; it may be empty, which declares that no attribute may appear. The
+body must contain only `effective_from` and `attributes` — unknown fields,
+illegal attribute names, illegal types, and a future `effective_from` are
+`validation_error`.
+
+Every successful submission **appends** a version: the type's schema versions
+are numbered continuously from 1, a submission never overwrites an earlier
+version, and a rejected submission consumes no number. The response carries
+`type`, `version`, `effective_from`, `recorded_at`, and `attributes`:
+
+```json
+{"type": "account", "version": 2,
+ "effective_from": "2024-01-01T00:00:00.000Z",
+ "recorded_at": "2024-05-31T00:00:00.000Z",
+ "attributes": {"tier": "string", "level": "number"}}
+```
+
+`GET /schemas/{type}` returns the version in effect at `as_of` and known at
+`known_at`, both defaulting to the current instant. A version is known only
+from its own `recorded_at` onwards, so a version submitted later at the same
+`effective_from` supersedes the earlier one only for readers past its own
+submission. Repeating `as_of` or `known_at` is a `validation_error`; a pair
+of coordinates at which no version is visible is a `not_found`.
+
+While a schema holds — from its `effective_from` to the next registered
+schema start — every attribute of every entity projection of the type must be
+declared in `attributes`, and an asserted value's type must match the
+declared type exactly (`number` does not include booleans; an asserted `null`
+has the type `null`). A retraction carries no value and is never
+type-checked. This is enforced in both directions:
+
+- **Submitting a schema** checks every entity of the type over exactly the
+  interval the new version will hold, as that history is visible at the
+  submission instant. One non-empty projection with an undeclared attribute
+  or a mistyped value rejects the submission with `conflict` and no version
+  is appended.
+- **Creating, correcting, or batch-importing entities** checks the entity's
+  resulting history against every schema version known at the write's
+  transaction instant: each valid-time interval must satisfy the contract
+  that holds there, so a fact window spanning several registered schema
+  intervals must satisfy each of them. A violation is a `validation_error`
+  (in a batch, carrying the one-based operation index and rolling the whole
+  batch back), and the failed write leaves no trace.
+
+A type with no registered schema keeps the free attribute semantics described
+above. Registering or changing a schema never rewrites, hides, or retracts a
+fact: reads, history, timeline, diffs, comparisons, and the audit ledger are
+computed exactly as before, and the batch endpoint gains no schema
+operations.
+
 ### Read an entity
 
 ```http
@@ -676,9 +749,11 @@ pre-upgrade history is auditable exactly like new writes.
 {"error":{"code":"validation_error","message":"human readable detail"}}
 ```
 
-Validation errors return 400, unknown routes and entities that are not in effect
-at the requested instant return 404, and a duplicate entity, a reused
-idempotency key, or a correction that would predate the entity returns 409.
+Validation errors return 400, unknown routes, entities that are not in effect
+at the requested instant, and schema coordinates with no visible version
+return 404, and a duplicate entity, a reused idempotency key, a correction
+that would predate the entity, or a schema submission incompatible with the
+recorded entity history returns 409.
 
 ## Invariants
 

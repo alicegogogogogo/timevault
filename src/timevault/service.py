@@ -16,12 +16,14 @@ from .model import (
     Entity,
     Fact,
     INFINITY,
+    Schema,
     attribute_name,
     identifier,
     instant,
     iso,
     parse_batch,
     value_same,
+    value_type,
 )
 from .store import ACTION_VERSION_APPENDED, ACTION_WINDOW_TRUNCATED, Store
 
@@ -291,6 +293,43 @@ class Version:
 
 Token = tuple[Version, int, int | None]
 Projection = dict[str, tuple[Any, int, str, int, int | None, int]]
+
+
+@dataclass(frozen=True)
+class SchemaVersion:
+    """One committed schema version, as read back from the database.
+
+    ``effective_from`` is the business instant the contract starts holding;
+    ``recorded_at`` is the transaction instant it was submitted.  A version is
+    visible to a reader only from its own ``recorded_at`` onwards, so two
+    versions sharing one ``effective_from`` do not clash: the one recorded
+    later wins, but only for readers past its submission.
+    """
+
+    entity_type: str
+    version: int
+    effective_from: int
+    recorded_at: int
+    attributes: dict[str, str]
+
+    @classmethod
+    def from_row(cls, entity_type: str, row: Any) -> "SchemaVersion":
+        return cls(
+            entity_type,
+            int(row["version"]),
+            int(row["effective_from"]),
+            int(row["recorded_at"]),
+            Store.decode(row["attributes"]),
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "type": self.entity_type,
+            "version": self.version,
+            "effective_from": iso(self.effective_from),
+            "recorded_at": iso(self.recorded_at),
+            "attributes": dict(self.attributes),
+        }
 
 
 def known_windows(versions: list[Version], known_at: int) -> list[Token]:
@@ -642,6 +681,173 @@ class TimeVault:
 
         return self._idempotent(key, _batch_operation_name(raw), action, moment)
 
+    # -- schemas --------------------------------------------------------------
+
+    def put_schema(self, entity_type: str, raw: Any, key: str | None) -> dict[str, Any]:
+        """Append one schema version for an entity type.
+
+        The new version takes effect at its ``effective_from`` and holds until
+        the next registered schema start; it never overwrites an earlier
+        version.  Before anything is stored, every entity of the type is
+        checked over exactly that interval: one non-empty projection with an
+        undeclared attribute or a mistyped value rejects the whole submission
+        with a conflict and no version is appended.
+        """
+        moment = self.store.now()
+        schema = Schema.parse(entity_type, raw, moment)
+
+        def action(recorded_at: int) -> dict[str, Any]:
+            return self._schema_core(schema, recorded_at)
+
+        return self._idempotent(key, f"schema:{schema.entity_type}", action, moment)
+
+    def get_schema(
+        self, entity_type: str, as_of: Any = None, known_at: Any = None
+    ) -> dict[str, Any]:
+        """The schema version in effect and known at the given coordinates.
+
+        Both coordinates default to the current instant.  A version is known
+        only from its own ``recorded_at`` onwards, so a version submitted
+        later at the same ``effective_from`` supersedes the earlier one only
+        for readers past its own submission.  Coordinates no version is
+        visible at are a ``not_found``.
+        """
+        moment = self.store.now()
+        as_of = moment if as_of is None else instant(as_of, "as_of")
+        known_at = moment if known_at is None else instant(known_at, "known_at")
+        version = self._schema_at(entity_type, as_of, known_at)
+        if version is None:
+            raise NotFoundError(
+                f"no schema for {entity_type} is in effect and known at that instant"
+            )
+        return version.as_dict()
+
+    def _schema_core(self, schema: Schema, recorded_at: int) -> dict[str, Any]:
+        """Validate and append one schema version at a fixed instant."""
+        existing = self._schema_versions(schema.entity_type)
+        later = [v.effective_from for v in existing if v.effective_from > schema.effective_from]
+        end = min(later) if later else INFINITY
+        declared = dict(schema.attributes)
+        for _, entity_id, _ in self.store.entity_keys(schema.entity_type):
+            for _, _, projection in self._entity_segments(
+                schema.entity_type, entity_id, schema.effective_from, end, recorded_at
+            ):
+                self._check_projection(
+                    declared,
+                    projection,
+                    ConflictError,
+                    f"entity {schema.entity_type}/{entity_id}: ",
+                )
+        version = self.store.next_schema_version(schema.entity_type)
+        self.store.insert_schema(
+            schema.entity_type, version, schema.effective_from, recorded_at, declared
+        )
+        return SchemaVersion(
+            schema.entity_type, version, schema.effective_from, recorded_at, declared
+        ).as_dict()
+
+    def _schema_versions(self, entity_type: str) -> list[SchemaVersion]:
+        return [
+            SchemaVersion.from_row(entity_type, row)
+            for row in self.store.schemas_for_type(entity_type)
+        ]
+
+    def _schema_at(
+        self, entity_type: str, as_of: int, known_at: int
+    ) -> SchemaVersion | None:
+        """The version in effect at ``as_of`` among those known at ``known_at``."""
+        chosen: SchemaVersion | None = None
+        for version in self._schema_versions(entity_type):
+            if version.effective_from > as_of or version.recorded_at > known_at:
+                continue
+            if chosen is None or (version.effective_from, version.version) > (
+                chosen.effective_from,
+                chosen.version,
+            ):
+                chosen = version
+        return chosen
+
+    def _enforce_schemas(self, entity_type: str, entity_id: str, recorded_at: int) -> None:
+        """Check an entity's resulting history against every known schema interval.
+
+        Runs inside the write's transaction, after the write's own rows are
+        placed: every segment of the entity's history that a schema known at
+        this transaction instant covers must satisfy it, so a fact window
+        spanning several registered schema intervals is checked against each
+        of them.  A type with no registered schema keeps the free attribute
+        semantics.  A violation raises before the transaction commits, so a
+        rejected write leaves no trace.
+        """
+        schemas = [
+            version
+            for version in self._schema_versions(entity_type)
+            if version.recorded_at <= recorded_at
+        ]
+        if not schemas:
+            return
+        start = min(version.effective_from for version in schemas)
+        segments = self._entity_segments(entity_type, entity_id, start, INFINITY, recorded_at)
+        for seg_start, seg_end, projection in segments:
+            # A projection segment can straddle several schema intervals; cut
+            # it at every schema start inside it so each part is checked
+            # against the contract that actually holds there.
+            cuts = [seg_start]
+            cuts.extend(
+                version.effective_from
+                for version in schemas
+                if seg_start < version.effective_from < seg_end
+            )
+            cuts.append(seg_end)
+            for index in range(len(cuts) - 1):
+                schema = self._schema_covering(schemas, cuts[index])
+                if schema is None:
+                    continue
+                self._check_projection(
+                    schema.attributes,
+                    projection,
+                    ValidationError,
+                    f"entity {entity_type}/{entity_id}: ",
+                )
+
+    @staticmethod
+    def _schema_covering(
+        schemas: list[SchemaVersion], at: int
+    ) -> SchemaVersion | None:
+        """The schema in effect at one valid instant, or ``None``."""
+        chosen: SchemaVersion | None = None
+        for version in schemas:
+            if version.effective_from > at:
+                continue
+            if chosen is None or (version.effective_from, version.version) > (
+                chosen.effective_from,
+                chosen.version,
+            ):
+                chosen = version
+        return chosen
+
+    @staticmethod
+    def _check_projection(
+        declared: dict[str, str],
+        projection: Projection,
+        error: type[TimeVaultError],
+        context: str,
+    ) -> None:
+        """Require every projected attribute to be declared and exactly typed.
+
+        A projection only ever holds assertions, so a retraction — which
+        carries a null value — is never type-checked here.  An asserted null,
+        on the other hand, has the type ``null`` and must be declared as such.
+        """
+        for name, entry in sorted(projection.items()):
+            if name not in declared:
+                raise error(f"{context}attribute {name} is not declared in the schema")
+            expected = declared[name]
+            actual = value_type(entry[0])
+            if actual != expected:
+                raise error(
+                    f"{context}attribute {name} must be of type {expected}, not {actual}"
+                )
+
     # -- reads --------------------------------------------------------------
 
     def entity_as_of(
@@ -805,42 +1011,7 @@ class TimeVault:
         # Every window edge strictly inside the interval is a cut candidate;
         # between two neighbouring cuts no window starts or ends, so the
         # projection sampled at a segment's start holds for the whole segment.
-        boundaries: set[int] = set()
-        for tokens in windows.values():
-            for _, token_start, token_end in tokens:
-                if start < token_start < end:
-                    boundaries.add(token_start)
-                if token_end is not None and start < token_end < end:
-                    boundaries.add(token_end)
-        points = [start, *sorted(boundaries), end]
-
-        spans: list[list[Any]] = []
-        for index in range(len(points) - 1):
-            seg_start, seg_end = points[index], points[index + 1]
-            projection: Projection = {}
-            for name in sorted(windows):
-                token = project(windows[name], seg_start)
-                if token is None:
-                    continue
-                version, window_start, window_end = token
-                projection[name] = (
-                    version.value,
-                    version.version,
-                    version.operation,
-                    window_start,
-                    window_end,
-                    version.recorded_at,
-                )
-            if not projection:
-                # Nothing in effect here: a gap, not a segment.
-                continue
-            if spans and spans[-1][1] == seg_start and spans[-1][2] == projection:
-                # A window edge nothing observable hinged on (a version no
-                # reader can ever select, for instance): the same versions
-                # keep supplying the projection, so the segment runs on.
-                spans[-1][1] = seg_end
-            else:
-                spans.append([seg_start, seg_end, projection])
+        spans = self._window_segments(windows, start, end)
 
         return {
             "type": entity_type,
@@ -1225,6 +1396,7 @@ class TimeVault:
                 None,
                 recorded_at,
             )
+        self._enforce_schemas(entity_type, entity_id, recorded_at)
         document = self._read(entity_type, entity_id, recorded_at, recorded_at)
         document["created_at"] = iso(recorded_at)
         return document
@@ -1251,6 +1423,7 @@ class TimeVault:
             )
         for fact in correction.facts:
             self._apply_fact(entity_type, entity_id, fact, recorded_at)
+        self._enforce_schemas(entity_type, entity_id, recorded_at)
         # ``as_of`` equal to the instant just recorded means "every window
         # that starts when this fact takes effect", which describes the
         # attribute as it stands after the correction rather than the state
@@ -1349,6 +1522,66 @@ class TimeVault:
 
     def _all_attributes(self, entity_type: str, entity_id: str) -> set[str]:
         return set(self._grouped_versions(entity_type, entity_id))
+
+    def _entity_segments(
+        self, entity_type: str, entity_id: str, start: int, end: int, known_at: int
+    ) -> list[list[Any]]:
+        """The entity's maximal constant-projection spans over ``[start, end)``."""
+        grouped = self._grouped_versions(entity_type, entity_id)
+        windows = {
+            name: known_windows(versions, known_at) for name, versions in grouped.items()
+        }
+        return self._window_segments(windows, start, end)
+
+    @staticmethod
+    def _window_segments(
+        windows: dict[str, list[Token]], start: int, end: int
+    ) -> list[list[Any]]:
+        """Cut ``[start, end)`` into the maximal spans sharing one projection.
+
+        A boundary lands wherever any visible window starts or ends; between
+        two neighbouring boundaries the projection sampled at the span's start
+        holds for the whole span.  A stretch with nothing in effect is a gap
+        and produces no span, and neighbouring spans with identical
+        projections merge into one.
+        """
+        boundaries: set[int] = set()
+        for tokens in windows.values():
+            for _, token_start, token_end in tokens:
+                if start < token_start < end:
+                    boundaries.add(token_start)
+                if token_end is not None and start < token_end < end:
+                    boundaries.add(token_end)
+        points = [start, *sorted(boundaries), end]
+
+        spans: list[list[Any]] = []
+        for index in range(len(points) - 1):
+            seg_start, seg_end = points[index], points[index + 1]
+            projection: Projection = {}
+            for name in sorted(windows):
+                token = project(windows[name], seg_start)
+                if token is None:
+                    continue
+                version, window_start, window_end = token
+                projection[name] = (
+                    version.value,
+                    version.version,
+                    version.operation,
+                    window_start,
+                    window_end,
+                    version.recorded_at,
+                )
+            if not projection:
+                # Nothing in effect here: a gap, not a segment.
+                continue
+            if spans and spans[-1][1] == seg_start and spans[-1][2] == projection:
+                # A window edge nothing observable hinged on (a version no
+                # reader can ever select, for instance): the same versions
+                # keep supplying the projection, so the segment runs on.
+                spans[-1][1] = seg_end
+            else:
+                spans.append([seg_start, seg_end, projection])
+        return spans
 
     def _read(
         self,
