@@ -424,6 +424,63 @@ different version supplies it. `attribute` may be repeated to narrow the result;
 naming an attribute the entity never had is a `validation_error`. `to` must be
 strictly later than `from`, and the entity must be in effect at both instants.
 
+### Walk an entity's timeline
+
+```http
+GET /entities/account/acct-1/timeline?from=2024-01-01T00:00:00Z&to=2024-07-01T00:00:00Z
+GET /entities/account/acct-1/timeline?from=...&to=...&known_at=2024-05-15T00:00:00Z
+```
+
+Where a plain read answers at one instant and `/diff` only compares the two
+endpoints, the timeline lists **every** state the entity held across a whole
+valid-time interval, so a brief value that is back in place by `to` — and would
+be invisible to a diff — is still reported. `from` and `to` are required, use
+the same instant forms as every other time parameter, and name the half-open
+interval `[from, to)`; `to` must be strictly later than `from`. `known_at` is
+optional and defaults to the current instant.
+
+```json
+{"type": "account", "id": "acct-1",
+ "from": "2024-01-01T00:00:00.000Z", "to": "2024-07-01T00:00:00.000Z",
+ "known_at": "2024-05-31T00:00:00.000Z",
+ "segments": [
+   {"valid_from": "2024-01-01T00:00:00.000Z", "valid_end": "2024-03-01T00:00:00.000Z",
+    "attributes": {"status": {"value": "active", "version": 1, "operation": "assert",
+                               "valid_from": "2024-01-01T00:00:00.000Z",
+                               "valid_end": "2024-03-01T00:00:00.000Z",
+                               "recorded_at": "2024-05-01T00:00:00.000Z"},
+                  "tier": {"value": "gold", "version": 1, "operation": "assert",
+                           "valid_from": "2024-01-01T00:00:00.000Z",
+                           "valid_end": "2024-03-01T00:00:00.000Z",
+                           "recorded_at": "2024-05-01T00:00:00.000Z"}}},
+   {"valid_from": "2024-03-01T00:00:00.000Z", "valid_end": "2024-07-01T00:00:00.000Z",
+    "attributes": {"tier": {"value": "platinum", "version": 2, "operation": "assert",
+                            "valid_from": "2024-03-01T00:00:00.000Z", "valid_end": null,
+                            "recorded_at": "2024-05-31T00:00:00.000Z"}}}]}
+```
+
+Each segment is a maximal half-open interval, clipped to `[from, to)`, on which
+the same set of versions supplies every attribute. A boundary is cut wherever
+any visible attribute starts, ends, is corrected, or is withdrawn — including
+when the new version saves the identical scalar value, so two adjacent
+segments are never merged. Several attributes changing at the same instant
+produce one boundary, not several. Each `attributes` entry has exactly the
+shape of a plain entity read's attribute projection. Segments do not overlap
+and are ordered by valid time; a stretch with no attribute in effect produces
+no entry there rather than an empty segment, so an entity that is known but
+holds nothing anywhere in the interval answers `200` with an empty
+`segments` list.
+
+Every version and every trim is interpreted under the single `known_at`: a
+correction recorded after it, and the window truncation it carried, do not
+exist for that read and can never split or close a segment there. The query is
+strictly read-only and deterministic — it writes no versions, truncations,
+audit, or idempotency records and moves no transaction time, and the same
+arguments on the same committed data always return the same document. An
+entity that never existed, or that had not been recorded by `known_at`, is
+`not_found`; missing bounds, malformed instants, a non-strict interval, and
+unknown query parameters are `validation_error`.
+
 ### Diff two snapshot facets
 
 ```http

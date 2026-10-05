@@ -754,6 +754,106 @@ class TimeVault:
             "changes": changes,
         }
 
+    def timeline(
+        self,
+        entity_type: str,
+        entity_id: str,
+        start: Any,
+        end: Any,
+        known_at: Any = None,
+    ) -> dict[str, Any]:
+        """Project the entity's full state across a valid-time interval.
+
+        The answer is the sequence of maximal half-open segments inside
+        ``[start, end)`` during which the same set of versions supplies every
+        attribute, all interpreted under one ``known_at`` cutoff.  A segment is
+        cut wherever any visible attribute starts, ends, is corrected, or is
+        withdrawn — the boundary comes from the visible windows themselves, so
+        adjacent segments are never merged even when the new version keeps the
+        same scalar value; several attributes changing at one instant share one
+        boundary.  Segments do not overlap, and a stretch with no attribute in
+        effect simply produces no entry there rather than an empty one.
+
+        Every window is reconstructed through :func:`known_windows`, so a
+        version or trim recorded after ``known_at`` never exists for this read
+        — including the truncation a later correction carries.  The query is
+        strictly read-only and, given the same committed data, deterministic
+        for the same arguments.  An entity that does not exist, or that was
+        recorded only after ``known_at``, is :class:`NotFoundError`; an entity
+        that is known but has nothing in effect anywhere in the interval comes
+        back with an empty ``segments`` list.
+        """
+        start = instant(start, "from")
+        end = instant(end, "to")
+        known_at = self.store.now() if known_at is None else instant(known_at, "known_at")
+        if end <= start:
+            raise ValidationError("to must be strictly later than from")
+        row = self.store.entity_row(entity_type, entity_id)
+        if row is None:
+            raise NotFoundError(f"entity {entity_type}/{entity_id} does not exist")
+        if int(row["created_at"]) > known_at:
+            raise NotFoundError(
+                f"entity {entity_type}/{entity_id} was not recorded yet at that transaction time"
+            )
+
+        grouped = self._grouped_versions(entity_type, entity_id)
+        # The visible tokens of each attribute, exactly as the reader at
+        # ``known_at`` knows them.  A retraction row and a superseded version
+        # reduce to an empty or inverted window: it never fills a segment on
+        # its own, but the boundary it creates still cuts the window in front
+        # of it.
+        tokens_by_name: dict[str, list[Token]] = {}
+        boundaries = {start, end}
+        for name in sorted(grouped):
+            tokens = known_windows(grouped[name], known_at)
+            tokens_by_name[name] = tokens
+            for _, valid_from, valid_end in tokens:
+                if valid_end is None or valid_end > valid_from:
+                    if start < valid_from < end:
+                        boundaries.add(valid_from)
+                    if valid_end is not None and start < valid_end < end:
+                        boundaries.add(valid_end)
+
+        ordered = sorted(boundaries)
+        segments: list[dict[str, Any]] = []
+        for left, right in zip(ordered, ordered[1:]):
+            # No window boundary falls inside (left, right), so membership is
+            # constant across the slice; the midpoint names exactly the set of
+            # versions that holds throughout [left, right).  ``project`` is the
+            # same selector a plain entity read uses, so a segment's attribute
+            # is the token that read would return at any instant in the slice.
+            middle = left + (right - left) // 2
+            attributes: dict[str, Any] = {}
+            for name in sorted(tokens_by_name):
+                window = project(tokens_by_name[name], middle)
+                if window is None:
+                    continue
+                version, _, window_end = window
+                attributes[name] = {
+                    "value": version.value,
+                    "version": version.version,
+                    "operation": version.operation,
+                    "valid_from": iso(version.valid_from),
+                    "valid_end": None if window_end is None else iso(window_end),
+                    "recorded_at": iso(version.recorded_at),
+                }
+            if attributes:
+                segments.append(
+                    {
+                        "valid_from": iso(left),
+                        "valid_end": iso(right),
+                        "attributes": attributes,
+                    }
+                )
+        return {
+            "type": entity_type,
+            "id": entity_id,
+            "from": iso(start),
+            "to": iso(end),
+            "known_at": iso(known_at),
+            "segments": segments,
+        }
+
     def snapshot_diff(
         self,
         entity_type: str | None = None,
