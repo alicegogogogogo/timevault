@@ -389,6 +389,52 @@ hides the trims recorded after it, so a correction recorded after `known_at`
 disappears from that earlier history view and the window it trimmed reads as open
 ended there.
 
+### Walk the timeline of one entity
+
+```http
+GET /entities/account/acct-1/timeline?from=2024-01-01T00:00:00Z&to=2024-06-01T00:00:00Z
+GET /entities/account/acct-1/timeline?from=...&to=...&known_at=2024-05-15T00:00:00Z
+```
+
+Every state the entity held across the half-open interval `[from, to)`, as the
+maximal segments during which the same versions supply the projection:
+
+```json
+{"type": "account", "id": "acct-1",
+ "from": "2024-01-01T00:00:00.000Z", "to": "2024-06-01T00:00:00.000Z",
+ "known_at": "2024-05-31T00:00:00.000Z",
+ "segments": [
+   {"valid_from": "2024-01-01T00:00:00.000Z",
+    "valid_end": "2024-03-01T00:00:00.000Z",
+    "attributes": {"tier": {"value": "gold", "version": 1, "operation": "assert",
+                            "valid_from": "2024-01-01T00:00:00.000Z",
+                            "valid_end": "2024-03-01T00:00:00.000Z",
+                            "recorded_at": "2024-05-01T00:00:00.000Z"}}},
+   {"valid_from": "2024-03-01T00:00:00.000Z",
+    "valid_end": "2024-06-01T00:00:00.000Z",
+    "attributes": {"tier": {"value": "platinum", "version": 2, "operation": "assert",
+                            "valid_from": "2024-03-01T00:00:00.000Z",
+                            "valid_end": null,
+                            "recorded_at": "2024-05-31T00:00:00.000Z"}}}]}
+```
+
+A boundary lands wherever any visible attribute starts, ends, is corrected, or
+is withdrawn — a correction that restates the same scalar value still splits the
+interval, because the version supplying it changes — while several attributes
+changing at one instant share a single boundary. Segment bounds are clipped to
+the query interval, segments never overlap, and each segment's `attributes` has
+exactly the shape a plain read reports at any instant inside it. A stretch where
+no attribute is in effect at all is a gap and produces no entry, so a caller
+sees even the short-lived states a two-endpoint diff would miss. `from` and `to`
+are required and `to` must be strictly later than `from`; `known_at` defaults to
+the current instant and pins the whole walk to one knowledge cutoff, so a
+correction recorded after it — and any trim it carried — does not leak in, and
+repeating the query over the same committed data always yields the same
+document. An entity that never existed, or was not recorded yet at `known_at`,
+is a `not_found`; an entity known then but holding nothing in effect anywhere in
+the interval answers `200` with an empty `segments` list. The query is
+read-only.
+
 ### Diff two business instants
 
 ```http

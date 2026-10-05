@@ -754,6 +754,110 @@ class TimeVault:
             "changes": changes,
         }
 
+    def timeline(
+        self,
+        entity_type: str,
+        entity_id: str,
+        start: Any,
+        end: Any,
+        known_at: Any = None,
+    ) -> dict[str, Any]:
+        """Walk every state one entity held across a valid-time interval.
+
+        The interval ``[from, to)`` is cut into the maximal half-open segments
+        during which the same set of versions supplies the projection: every
+        instant inside one segment reads the same attributes from the same
+        versions.  A boundary lands wherever any visible attribute starts,
+        ends, is corrected, or is withdrawn — a correction that restates the
+        same scalar value still splits the interval, because the version
+        supplying the value changes — while several attributes changing at
+        one instant share a single boundary.  Segment bounds are clipped to
+        the query interval, segments never overlap, and a stretch where no
+        attribute is in effect at all is a gap: it produces no entry.
+
+        Everything is interpreted under one ``known_at`` (the current instant
+        unless given): a correction recorded after it, and any window trim
+        that correction carried, does not exist for this walk, so repeating
+        the query over the same committed data always yields the same
+        document.  The query is read-only: it appends no versions, records no
+        truncations, and moves no transaction time.
+        """
+        start = instant(start, "from")
+        end = instant(end, "to")
+        known_at = self.store.now() if known_at is None else instant(known_at, "known_at")
+        if end <= start:
+            raise ValidationError("to must be strictly later than from")
+        # One lock acquisition spans the whole walk, so every window is read
+        # against the same committed ledger even if a write lands concurrently.
+        with self.store.lock:
+            row = self.store.entity_row(entity_type, entity_id)
+            if row is None:
+                raise NotFoundError(f"entity {entity_type}/{entity_id} does not exist")
+            if int(row["created_at"]) > known_at:
+                raise NotFoundError(
+                    f"entity {entity_type}/{entity_id} was not recorded yet at that transaction time"
+                )
+            grouped = self._grouped_versions(entity_type, entity_id)
+            windows = {
+                name: known_windows(versions, known_at) for name, versions in grouped.items()
+            }
+
+        # Every window edge strictly inside the interval is a cut candidate;
+        # between two neighbouring cuts no window starts or ends, so the
+        # projection sampled at a segment's start holds for the whole segment.
+        boundaries: set[int] = set()
+        for tokens in windows.values():
+            for _, token_start, token_end in tokens:
+                if start < token_start < end:
+                    boundaries.add(token_start)
+                if token_end is not None and start < token_end < end:
+                    boundaries.add(token_end)
+        points = [start, *sorted(boundaries), end]
+
+        spans: list[list[Any]] = []
+        for index in range(len(points) - 1):
+            seg_start, seg_end = points[index], points[index + 1]
+            projection: Projection = {}
+            for name in sorted(windows):
+                token = project(windows[name], seg_start)
+                if token is None:
+                    continue
+                version, window_start, window_end = token
+                projection[name] = (
+                    version.value,
+                    version.version,
+                    version.operation,
+                    window_start,
+                    window_end,
+                    version.recorded_at,
+                )
+            if not projection:
+                # Nothing in effect here: a gap, not a segment.
+                continue
+            if spans and spans[-1][1] == seg_start and spans[-1][2] == projection:
+                # A window edge nothing observable hinged on (a version no
+                # reader can ever select, for instance): the same versions
+                # keep supplying the projection, so the segment runs on.
+                spans[-1][1] = seg_end
+            else:
+                spans.append([seg_start, seg_end, projection])
+
+        return {
+            "type": entity_type,
+            "id": entity_id,
+            "from": iso(start),
+            "to": iso(end),
+            "known_at": iso(known_at),
+            "segments": [
+                {
+                    "valid_from": iso(seg_start),
+                    "valid_end": iso(seg_end),
+                    "attributes": self._projection_attributes(projection),
+                }
+                for seg_start, seg_end, projection in spans
+            ],
+        }
+
     def snapshot_diff(
         self,
         entity_type: str | None = None,
@@ -1257,16 +1361,10 @@ class TimeVault:
         projection = self._projection(entity_type, entity_id, as_of, known_at, required)
         return self._projection_document(entity_type, entity_id, as_of, known_at, projection)
 
-    def _projection_document(
-        self,
-        entity_type: str,
-        entity_id: str,
-        as_of: int,
-        known_at: int,
-        projection: Projection,
-    ) -> dict[str, Any]:
-        """Render a projection as the public record a read reports."""
-        attributes = {
+    @staticmethod
+    def _projection_attributes(projection: Projection) -> dict[str, Any]:
+        """Render a projection's attribute map the way every read reports it."""
+        return {
             name: {
                 "value": entry[0],
                 "version": entry[1],
@@ -1277,12 +1375,22 @@ class TimeVault:
             }
             for name, entry in sorted(projection.items())
         }
+
+    def _projection_document(
+        self,
+        entity_type: str,
+        entity_id: str,
+        as_of: int,
+        known_at: int,
+        projection: Projection,
+    ) -> dict[str, Any]:
+        """Render a projection as the public record a read reports."""
         return {
             "type": entity_type,
             "id": entity_id,
             "as_of": iso(as_of),
             "known_at": iso(known_at),
-            "attributes": attributes,
+            "attributes": self._projection_attributes(projection),
         }
 
     def _snapshot(

@@ -117,6 +117,19 @@ def make_handler(service: TimeVault) -> type[BaseHTTPRequestHandler]:
                 return 200, service.history(
                     parts[0], parts[1], self._instant_parameter(query, "known_at")
                 )
+            if len(parts) == 3 and parts[2] == "timeline" and self.command == "GET":
+                only(query, {"from", "to", "known_at"})
+                raw_from = one(query, "from")
+                raw_to = one(query, "to")
+                if raw_from is None or raw_to is None:
+                    raise ValidationError("timeline requires both from and to")
+                return 200, service.timeline(
+                    parts[0],
+                    parts[1],
+                    instant(raw_from, "from"),
+                    instant(raw_to, "to"),
+                    self._instant_parameter(query, "known_at"),
+                )
             raise NotFoundError("route was not found")
 
         def _diff(self, query: dict[str, list[str]]) -> tuple[int, Any]:
