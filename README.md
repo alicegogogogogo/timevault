@@ -320,6 +320,72 @@ Replaying a key returns the first batch's stored 200 response and writes
 nothing, so replayed batches add no versions; reusing a key for a different
 batch request is a `conflict`.
 
+### Declare a schema for a type
+
+```http
+PUT /schemas/account
+Idempotency-Key: schema-1
+
+{
+  "effective_from": "2024-01-01T00:00:00Z",
+  "attributes": {"status": "string", "tier": "string", "score": "number"}
+}
+```
+
+A type without a schema keeps the free attribute semantics described above;
+registering a schema puts the type under an evolving, bitemporal contract.
+The body carries only `effective_from` — the valid-time instant the version
+starts governing at, in any of the accepted instant forms, never later than
+the request's transaction instant — and `attributes`, a map of attribute
+name to exactly one of `string`, `number`, `boolean`, or `null` (possibly
+empty, which forbids every attribute while the version governs). Unknown
+fields, illegal attribute names, illegal type names, and a future
+`effective_from` are `validation_error`.
+
+A successful submission appends the next consecutive `version` stamped with
+the request's `recorded_at`; earlier versions are never overwritten. The
+response is the committed version:
+
+```json
+{"type": "account", "version": 1,
+ "effective_from": "2024-01-01T00:00:00.000Z",
+ "recorded_at": "2024-05-31T00:00:00.000Z",
+ "attributes": {"status": "string", "tier": "string", "score": "number"}}
+```
+
+Before anything is appended, the visible history of every entity of the
+type is checked across the whole interval the new version would govern —
+from its `effective_from` to the start of the next registered version. If
+any non-empty projection in that interval holds an attribute the schema
+does not declare, or a value whose type does not match exactly (`number`
+does not include booleans; a retraction's empty placeholder is never judged
+by its null value), the submission is a `conflict` and leaves no version
+behind.
+
+```http
+GET /schemas/account
+GET /schemas/account?as_of=2024-02-01T00:00:00Z&known_at=2024-05-15T00:00:00Z
+```
+
+Reads the version that was in effect at `as_of` and already knowable at
+`known_at`; both default to the current instant and may each be given at
+most once. A version submitted later against the same `effective_from` is
+visible only from its own `recorded_at` onwards, so an earlier `known_at`
+still answers with the version it replaces. When no version is visible at
+the requested coordinates the answer is `not_found`.
+
+While a schema governs, every write to the type — create, correction, or
+batch import — is validated after it lands: each interval of the entity's
+history must satisfy the schema version governing that interval and
+knowable at the write's transaction instant, so a fact window spanning
+several registered schema intervals is checked segment by segment. An
+undeclared attribute or a mismatched value type is a `validation_error`
+and rolls the whole write back — a failed batch item still reports its
+one-based operation index and nothing is stored. Registering or changing a
+schema never rewrites, hides, or retracts a fact: reads, history,
+timelines, diffs, comparisons, and the audit ledger are untouched, and the
+batch endpoint gains no schema operations.
+
 ### Read an entity
 
 ```http

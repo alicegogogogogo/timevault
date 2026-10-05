@@ -16,12 +16,14 @@ from .model import (
     Entity,
     Fact,
     INFINITY,
+    Schema,
     attribute_name,
     identifier,
     instant,
     iso,
     parse_batch,
     value_same,
+    value_type,
 )
 from .store import ACTION_VERSION_APPENDED, ACTION_WINDOW_TRUNCATED, Store
 
@@ -291,6 +293,55 @@ class Version:
 
 Token = tuple[Version, int, int | None]
 Projection = dict[str, tuple[Any, int, str, int, int | None, int]]
+
+
+@dataclass(frozen=True)
+class SchemaVersion:
+    """One committed schema version, as read back from the database.
+
+    ``effective_from`` is the valid-time instant the version starts governing
+    at; ``recorded_at`` is the transaction instant it was submitted.  A reader
+    (or a write being validated) sees the version only from ``recorded_at``
+    onwards, so two versions sharing one ``effective_from`` are told apart by
+    how late they were recorded.
+    """
+
+    version: int
+    effective_from: int
+    recorded_at: int
+    attributes: dict[str, str]
+
+    @classmethod
+    def from_row(cls, row: Any) -> "SchemaVersion":
+        return cls(
+            version=int(row["version"]),
+            effective_from=int(row["effective_from"]),
+            recorded_at=int(row["recorded_at"]),
+            attributes=dict(Store.decode(row["attributes"])),
+        )
+
+
+def governing_schema(
+    schemas: list[SchemaVersion], at: int, known_at: int
+) -> SchemaVersion | None:
+    """The schema version governing business instant ``at`` for a reader.
+
+    Among the versions already knowable at ``known_at`` whose ``effective_from``
+    has been reached, the one with the latest effective start wins; two versions
+    submitted against the same effective start are ordered by their own
+    ``recorded_at``, so a later restatement of the same start only takes over
+    from the instant it was recorded.
+    """
+    best: SchemaVersion | None = None
+    for schema in schemas:
+        if schema.recorded_at > known_at or schema.effective_from > at:
+            continue
+        if best is None or (schema.effective_from, schema.recorded_at) > (
+            best.effective_from,
+            best.recorded_at,
+        ):
+            best = schema
+    return best
 
 
 def known_windows(versions: list[Version], known_at: int) -> list[Token]:
@@ -641,6 +692,54 @@ class TimeVault:
             return {"recorded_at": iso(recorded_at), "results": results}
 
         return self._idempotent(key, _batch_operation_name(raw), action, moment)
+
+    def put_schema(self, entity_type: str, raw: Any, key: str | None) -> dict[str, Any]:
+        """Append one schema version for an entity type.
+
+        The new version starts governing at its ``effective_from`` and is
+        knowable from the request's transaction instant onwards; earlier
+        versions stay readable through ``as_of``/``known_at`` and are never
+        rewritten.  Before anything is appended, the visible history of every
+        entity of the type is checked against the new declaration across the
+        whole interval the version would govern — from ``effective_from`` to
+        the start of the next registered version — and any unknown attribute or
+        mismatched value type in a non-empty projection rejects the
+        submission with a conflict and leaves no version behind.
+        """
+        moment = self.store.now()
+        schema = Schema.parse(entity_type, raw, moment)
+
+        def action(recorded_at: int) -> dict[str, Any]:
+            return self._schema_core(schema, recorded_at)
+
+        return self._idempotent(key, f"schema:{schema.entity_type}", action, moment)
+
+    def get_schema(
+        self, entity_type: str, as_of: Any = None, known_at: Any = None
+    ) -> dict[str, Any]:
+        """The schema version in effect and knowable at the given coordinates.
+
+        Both coordinates default to the current instant.  A version submitted
+        later against the same effective start is visible only from its own
+        ``recorded_at`` onwards, so an earlier ``known_at`` still answers with
+        the version it replaces.  When no version is visible at the
+        coordinates the answer is ``not_found``.
+        """
+        moment = self.store.now()
+        as_of = moment if as_of is None else instant(as_of, "as_of")
+        known_at = moment if known_at is None else instant(known_at, "known_at")
+        schemas = self._schema_versions(entity_type)
+        visible = [
+            schema
+            for schema in schemas
+            if schema.recorded_at <= known_at and schema.effective_from <= as_of
+        ]
+        if not visible:
+            raise NotFoundError(
+                f"no schema for type {entity_type} is visible at those coordinates"
+            )
+        current = max(visible, key=lambda item: (item.effective_from, item.recorded_at))
+        return self._schema_document(entity_type, current)
 
     # -- reads --------------------------------------------------------------
 
@@ -1225,6 +1324,7 @@ class TimeVault:
                 None,
                 recorded_at,
             )
+        self._enforce_schemas(entity_type, entity_id, recorded_at)
         document = self._read(entity_type, entity_id, recorded_at, recorded_at)
         document["created_at"] = iso(recorded_at)
         return document
@@ -1251,6 +1351,7 @@ class TimeVault:
             )
         for fact in correction.facts:
             self._apply_fact(entity_type, entity_id, fact, recorded_at)
+        self._enforce_schemas(entity_type, entity_id, recorded_at)
         # ``as_of`` equal to the instant just recorded means "every window
         # that starts when this fact takes effect", which describes the
         # attribute as it stands after the correction rather than the state
@@ -1318,6 +1419,163 @@ class TimeVault:
             fact.valid_from if fact.deleted else fact.valid_end,
             recorded_at,
         )
+
+    def _schema_versions(self, entity_type: str) -> list[SchemaVersion]:
+        return [
+            SchemaVersion.from_row(row) for row in self.store.schemas_for_type(entity_type)
+        ]
+
+    @staticmethod
+    def _schema_document(entity_type: str, schema: SchemaVersion) -> dict[str, Any]:
+        return {
+            "type": entity_type,
+            "version": schema.version,
+            "effective_from": iso(schema.effective_from),
+            "recorded_at": iso(schema.recorded_at),
+            "attributes": dict(schema.attributes),
+        }
+
+    def _schema_core(
+        self, schema: Schema, recorded_at: int
+    ) -> dict[str, Any]:
+        """Append one already-parsed schema version at a fixed instant."""
+        existing = self._schema_versions(schema.entity_type)
+        # The interval the new version would govern runs from its own
+        # effective start to the next registered start; everything outside
+        # that interval keeps the version that already governs it.
+        later = [item.effective_from for item in existing if item.effective_from > schema.effective_from]
+        next_start = min(later) if later else None
+        self._check_schema_registration(
+            schema.entity_type, schema.attributes, schema.effective_from, next_start, recorded_at
+        )
+        version = self.store.next_schema_version(schema.entity_type)
+        self.store.insert_schema(
+            schema.entity_type, version, schema.effective_from, recorded_at, schema.attributes
+        )
+        return self._schema_document(
+            schema.entity_type,
+            SchemaVersion(version, schema.effective_from, recorded_at, schema.attributes),
+        )
+
+    @staticmethod
+    def _projection_values(
+        windows: dict[str, list[Token]], at: int
+    ) -> dict[str, Any]:
+        """The attribute values in effect at one instant, for schema checks."""
+        values: dict[str, Any] = {}
+        for name in sorted(windows):
+            window = project(windows[name], at)
+            if window is not None:
+                values[name] = window[0].value
+        return values
+
+    def _check_schema_registration(
+        self,
+        entity_type: str,
+        attributes: dict[str, str],
+        effective_from: int,
+        next_start: int | None,
+        known_at: int,
+    ) -> None:
+        """Reject a schema that the recorded history of its type contradicts.
+
+        Every entity of the type is walked across ``[effective_from,
+        next_start)`` as knowable at the submission's transaction instant.
+        Each non-empty projection in that interval must use only declared
+        attributes, each holding exactly the declared value type; a
+        retraction never appears in a projection, so its empty placeholder is
+        never judged by its null value.  Any contradiction is a conflict and
+        the submission leaves no version behind.
+        """
+        for type_name, entity_id, created_at in self.store.entity_keys(entity_type):
+            if created_at > known_at:
+                continue
+            grouped = self._grouped_versions(type_name, entity_id)
+            windows = {
+                name: known_windows(versions, known_at)
+                for name, versions in grouped.items()
+            }
+            # The projection can only change where a window starts or ends, so
+            # sampling those instants inside the governed interval (plus its
+            # start) covers every state the interval contains.
+            points = {effective_from}
+            for tokens in windows.values():
+                for _, start, end in tokens:
+                    if start > effective_from:
+                        points.add(start)
+                    if end is not None and end > effective_from:
+                        points.add(end)
+            for at in sorted(points):
+                if next_start is not None and at >= next_start:
+                    break
+                projection = self._projection_values(windows, at)
+                for name, value in projection.items():
+                    if name not in attributes:
+                        raise ConflictError(
+                            f"schema conflicts with the recorded history of "
+                            f"{type_name}/{entity_id}: attribute {name} is not declared"
+                        )
+                    actual = value_type(value)
+                    if actual != attributes[name]:
+                        raise ConflictError(
+                            f"schema conflicts with the recorded history of "
+                            f"{type_name}/{entity_id}: attribute {name} holds {actual}, "
+                            f"the schema declares {attributes[name]}"
+                        )
+
+    def _enforce_schemas(self, entity_type: str, entity_id: str, known_at: int) -> None:
+        """Validate one entity's visible history against the known schemas.
+
+        Called after a write has landed but before its transaction commits:
+        every interval of the entity's history must satisfy the schema version
+        governing that interval and knowable at the write's transaction
+        instant.  A fact window that spans several registered schema intervals
+        is checked segment by segment, because the governing version changes
+        at each schema's effective start.  A type with no registered schema
+        keeps the free attribute semantics.  A violation raises
+        :class:`ValidationError`, which rolls the whole write back.
+        """
+        schemas = [
+            schema
+            for schema in self._schema_versions(entity_type)
+            if schema.recorded_at <= known_at
+        ]
+        if not schemas:
+            return
+        grouped = self._grouped_versions(entity_type, entity_id)
+        windows = {
+            name: known_windows(versions, known_at) for name, versions in grouped.items()
+        }
+        # The projection changes at window edges, the governing schema at
+        # effective starts; sampling every such instant sees every segment.
+        points: set[int] = set()
+        for tokens in windows.values():
+            for _, start, end in tokens:
+                points.add(start)
+                if end is not None:
+                    points.add(end)
+        for schema in schemas:
+            points.add(schema.effective_from)
+        for at in sorted(points):
+            projection = self._projection_values(windows, at)
+            if not projection:
+                continue
+            schema = governing_schema(schemas, at, known_at)
+            if schema is None:
+                # No schema has started governing this interval: free semantics.
+                continue
+            for name, value in projection.items():
+                if name not in schema.attributes:
+                    raise ValidationError(
+                        f"attribute {name} is not declared in the schema for type {entity_type}"
+                    )
+                actual = value_type(value)
+                expected = schema.attributes[name]
+                if actual != expected:
+                    raise ValidationError(
+                        f"attribute {name} must hold {expected} according to the schema "
+                        f"for type {entity_type}, not {actual}"
+                    )
 
     def _grouped_versions(self, entity_type: str, entity_id: str) -> dict[str, list[Version]]:
         """Every version of the entity, with the trims it took attached.

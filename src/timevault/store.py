@@ -75,6 +75,16 @@ class Store:
             );
             CREATE INDEX IF NOT EXISTS truncations_by_version
               ON truncations(type, id, attribute, version, recorded_at);
+            CREATE TABLE IF NOT EXISTS schemas (
+              type TEXT NOT NULL,
+              version INTEGER NOT NULL,
+              effective_from INTEGER NOT NULL,
+              recorded_at INTEGER NOT NULL,
+              attributes TEXT NOT NULL,
+              PRIMARY KEY (type, version)
+            );
+            CREATE INDEX IF NOT EXISTS schemas_by_type
+              ON schemas(type, effective_from, recorded_at);
             CREATE TABLE IF NOT EXISTS idempotency (
               key TEXT PRIMARY KEY,
               operation TEXT NOT NULL,
@@ -531,6 +541,48 @@ class Store:
                 valid_end,
             ),
         )
+
+    # -- schemas ------------------------------------------------------------
+
+    def insert_schema(
+        self,
+        entity_type: str,
+        version: int,
+        effective_from: int,
+        recorded_at: int,
+        attributes: dict[str, str],
+    ) -> None:
+        """Append one schema version; existing versions are never touched."""
+        self.connection.execute(
+            """
+            INSERT INTO schemas(type, version, effective_from, recorded_at, attributes)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (entity_type, version, effective_from, recorded_at, self.encode(attributes)),
+        )
+
+    def schemas_for_type(self, entity_type: str) -> list[sqlite3.Row]:
+        """Every schema version of one type, in valid- then transaction-time order."""
+        with self.lock:
+            return list(
+                self.connection.execute(
+                    """
+                    SELECT version, effective_from, recorded_at, attributes
+                      FROM schemas
+                     WHERE type = ?
+                     ORDER BY effective_from, recorded_at, version
+                    """,
+                    (entity_type,),
+                ).fetchall()
+            )
+
+    def next_schema_version(self, entity_type: str) -> int:
+        with self.lock:
+            row = self.connection.execute(
+                "SELECT COALESCE(MAX(version), 0) + 1 AS next FROM schemas WHERE type = ?",
+                (entity_type,),
+            ).fetchone()
+        return int(row["next"])
 
     # -- idempotency --------------------------------------------------------
 

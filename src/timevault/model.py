@@ -403,6 +403,52 @@ def parse_batch(raw: Any, now: int) -> tuple[BatchCreate | BatchCorrect, ...]:
     )
 
 
+SCHEMA_VALUE_TYPES = ("string", "number", "boolean", "null")
+"""The only type names a schema may declare for an attribute."""
+
+
+@dataclass(frozen=True)
+class Schema:
+    """One requested schema version for an entity type.
+
+    ``effective_from`` is the valid-time instant the schema starts governing
+    at; ``attributes`` maps every declared attribute name to the exact value
+    type it must hold while this version is in effect.  The mapping may be
+    empty, which forbids every attribute while the version governs.
+    """
+
+    entity_type: str
+    effective_from: int
+    attributes: dict[str, str]
+
+    @classmethod
+    def parse(cls, entity_type: Any, raw: Any, now: int) -> "Schema":
+        if not isinstance(raw, dict):
+            raise ValidationError("request body must be a JSON object")
+        unknown = sorted(set(raw) - {"effective_from", "attributes"})
+        if unknown:
+            raise ValidationError(f"unknown field(s): {', '.join(unknown)}")
+        for required in ("effective_from", "attributes"):
+            if required not in raw:
+                raise ValidationError(f"{required} is required")
+        effective_from = instant(raw["effective_from"], "effective_from")
+        if effective_from > now:
+            raise ValidationError("effective_from must not be in the future")
+        raw_attributes = raw["attributes"]
+        if not isinstance(raw_attributes, dict):
+            raise ValidationError("attributes must be an object")
+        attributes: dict[str, str] = {}
+        for name, kind in raw_attributes.items():
+            checked = attribute_name(name)
+            if not isinstance(kind, str) or kind not in SCHEMA_VALUE_TYPES:
+                raise ValidationError(
+                    f"attribute {checked}: type must be one of "
+                    + ", ".join(SCHEMA_VALUE_TYPES)
+                )
+            attributes[checked] = kind
+        return cls(identifier(entity_type, "entity type"), effective_from, attributes)
+
+
 def epoch_millis(moment: datetime) -> int:
     """Convert an aware datetime to integer epoch milliseconds."""
     return _from_datetime(moment, "clock")

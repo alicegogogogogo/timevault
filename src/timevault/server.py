@@ -86,6 +86,8 @@ def make_handler(service: TimeVault) -> type[BaseHTTPRequestHandler]:
                 return self._snapshot_diff(query)
             if parts == ["audit"]:
                 return self._audit(query)
+            if parts and parts[0] == "schemas":
+                return self._schema_routes(parts[1:], query, key)
             if parts and parts[0] == "entities":
                 return self._entity_routes(parts[1:], query, key)
             raise NotFoundError("route was not found")
@@ -128,6 +130,23 @@ def make_handler(service: TimeVault) -> type[BaseHTTPRequestHandler]:
                     parts[1],
                     instant(raw_from, "from"),
                     instant(raw_to, "to"),
+                    self._instant_parameter(query, "known_at"),
+                )
+            raise NotFoundError("route was not found")
+
+        def _schema_routes(
+            self, parts: list[str], query: dict[str, list[str]], key: str | None
+        ) -> tuple[int, Any]:
+            if len(parts) != 1:
+                raise NotFoundError("route was not found")
+            if self.command == "PUT":
+                only(query, set())
+                return 200, service.put_schema(parts[0], self._body(), key)
+            if self.command == "GET":
+                only(query, {"as_of", "known_at"})
+                return 200, service.get_schema(
+                    parts[0],
+                    self._instant_parameter(query, "as_of"),
                     self._instant_parameter(query, "known_at"),
                 )
             raise NotFoundError("route was not found")
